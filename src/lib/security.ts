@@ -56,9 +56,8 @@ export function secureWipe(arr: Uint8Array) {
 
 // Tor Project's own onion service (from torproject.org's Onion-Location header).
 // Only a browser routed through Tor can load it; other browsers refuse .onion outright.
-// Browsers may rewrite http:// images to https://, so both forms are probed.
 const TOR_ONION = '2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion'
-const TOR_PROBE_ORIGINS = [`http://${TOR_ONION}`, `https://${TOR_ONION}`]
+const TOR_PROBE_ORIGINS = [`https://${TOR_ONION}`]
 const TOR_PROBE_PATH = '/static/images/tor-logo@2x.png'
 
 export async function detectTor(timeoutMs = 30000): Promise<boolean> {
