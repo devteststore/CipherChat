@@ -167,7 +167,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
   function buildZcashUri(address: string, memo?: string, amount?: string): string {
     const amt = amount || '0.00001'
     if (!memo) return `zcash:${address}?amount=${amt}`
-    return `zcash:${address}?amount=${amt}&memo=${memo}`
+    return `zcash:${address}?amount=${amt}&memo=${toBase64Url(memo)}`
   }
 
   function startSendZec() {
