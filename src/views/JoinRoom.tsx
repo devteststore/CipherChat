@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import type { RoomData } from '../lib/crypto'
 import {
   normalizeInviteCode, deriveInviteKeys, encryptJson, decryptJson, isValidZcashAddress,
-  generateEphemeral, deriveSessionKey,
+  generateEphemeral, deriveSessionKey, inviteCheckCode,
 } from '../lib/crypto'
 import { publish, subscribe } from '../lib/transport'
 import type { InviteRequest, InviteReply, RoomPayload } from './ChatRoom'
@@ -91,7 +91,8 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
 
       const request: InviteRequest = { t: 'req', n: nonce, pk: eph.publicKey }
       const sendRequest = async () => { if (!done) publish(tag, await encryptJson(request, key, true)) }
-      setStatus('waiting for the person who invited you to approve...')
+      const check = await inviteCheckCode(tag)
+      setStatus(`check code ${check} for wallet ${myAddress.slice(0, 10)}...${myAddress.slice(-8)} — waiting for approval. the inviter's screen must show the same check code; if it differs, the wallet address or code does not match the invite.`)
       interval = setInterval(sendRequest, REQUEST_INTERVAL_MS)
       setTimeout(sendRequest, 500)
 

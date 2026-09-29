@@ -243,6 +243,13 @@ export async function deriveInviteKeys(code: string, address: string): Promise<I
   return { key, tag }
 }
 
+// Short value both sides can compare on screen: equal only if code AND address match.
+// Derived from the relay channel tag, which relays already see, so it reveals nothing new.
+export async function inviteCheckCode(tag: string): Promise<string> {
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('cipherchat-check|' + tag)))
+  return uint8ToHex(h.slice(0, 2)).toUpperCase()
+}
+
 // Padding hides message length from relays. JSON.parse ignores trailing spaces.
 const PAD_BUCKETS = [512, 2048, 8192, 16384]
 

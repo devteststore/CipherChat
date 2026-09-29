@@ -4,7 +4,7 @@ import type { RoomData } from '../lib/crypto'
 import {
   KeyRing, currentEpoch, isValidZcashAddress, normalizeAddress,
   generateInviteCode, deriveInviteKeys, encryptJson, decryptJson,
-  generateEphemeral, deriveSessionKey,
+  generateEphemeral, deriveSessionKey, inviteCheckCode,
 } from '../lib/crypto'
 import { publish, subscribe, hashChannel } from '../lib/transport'
 
@@ -95,7 +95,7 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
   const [addingMember, setAddingMember] = useState('')
   const [inviteSending, setInviteSending] = useState(false)
   const [inviteError, setInviteError] = useState('')
-  const [pendingInvite, setPendingInvite] = useState<{ recipient: string; code: string } | null>(null)
+  const [pendingInvite, setPendingInvite] = useState<{ recipient: string; code: string; check: string } | null>(null)
   const [qrVisible, setQrVisible] = useState(false)
   const [joinRequests, setJoinRequests] = useState<string[]>([])
   const [channelHash, setChannelHash] = useState('')
@@ -286,11 +286,12 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
       }, INVITE_TTL_MS)
       invites.current.set(addr, { tag, key, unsub, timer })
 
-      setPendingInvite({ recipient: addr, code })
+      const check = await inviteCheckCode(tag)
+      setPendingInvite({ recipient: addr, code, check })
       setQrVisible(false)
       setAddingMember('')
       setMessages(prev => [...prev, {
-        id: crypto.randomUUID(), senderAddress: '', text: `invite ready for ${truncate(addr)} — keep this chat open until they join (expires in 30 min)`,
+        id: crypto.randomUUID(), senderAddress: '', text: `invite ready for ${truncate(addr)} — check code ${check}. keep this chat open until they join (expires in 30 min). any older invite for this address is cancelled.`,
         timestamp: Math.floor(Date.now() / 1000), system: true,
       }])
     } catch {
@@ -482,9 +483,14 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
                 <span className="step-label">amount</span>
                 <code className="outgoing-amount">0.00001 ZEC</code>
               </div>
+              <div className="outgoing-field">
+                <span className="step-label">check code</span>
+                <code className="outgoing-amount">{pendingInvite.check}</code>
+              </div>
             </div>
           </div>
           <p className="outgoing-hint">
+            the guest's join screen will show the same check code if their wallet address and code are right.
             make sure nobody can see or photograph your screen. the qr hides again after 45 seconds.
             scan with your zcash wallet and send, then keep this chat open to approve them.
           </p>
