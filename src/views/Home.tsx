@@ -1,7 +1,10 @@
 import { useState, useEffect } from 'react'
 import { config } from '../config'
 import { isValidZcashAddress } from '../lib/crypto'
-import { warmUp, connectedRelayCount } from '../lib/transport'
+import { warmUp, connectedRelayCount, allowNetwork } from '../lib/transport'
+import { detectTor } from '../lib/security'
+
+const TOR_LABEL = 'tor network — ip hidden'
 
 interface Props {
   onStartChat: (address: string) => void
@@ -9,25 +12,30 @@ interface Props {
 }
 
 const ASCII_LOGO = `
- ███████╗███████╗ ██████╗██╗  ██╗ █████╗ ████████╗
- ╚══███╔╝██╔════╝██╔════╝██║  ██║██╔══██╗╚══██╔══╝
-   ███╔╝ █████╗  ██║     ███████║███████║   ██║
-  ███╔╝  ██╔══╝  ██║     ██╔══██║██╔══██║   ██║
- ███████╗███████╗╚██████╗██║  ██║██║  ██║   ██║
- ╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝`.trim()
+ ██████╗██╗██████╗ ██╗  ██╗███████╗██████╗  ██████╗██╗  ██╗ █████╗ ████████╗
+██╔════╝██║██╔══██╗██║  ██║██╔════╝██╔══██╗██╔════╝██║  ██║██╔══██╗╚══██╔══╝
+██║     ██║██████╔╝███████║█████╗  ██████╔╝██║     ███████║███████║   ██║
+██║     ██║██╔═══╝ ██╔══██║██╔══╝  ██╔══██╗██║     ██╔══██║██╔══██║   ██║
+╚██████╗██║██║     ██║  ██║███████╗██║  ██║╚██████╗██║  ██║██║  ██║   ██║
+ ╚═════╝╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝`.slice(1)
 
 export function Home({ onStartChat, onJoinChat }: Props) {
   const [address, setAddress] = useState('')
+  const [runId, setRunId] = useState(0)
+  const [copied, setCopied] = useState(false)
   const [checks, setChecks] = useState<{ label: string; ok: boolean | null }[]>([
     { label: 'webcrypto engine', ok: null },
     { label: 'aes-256-gcm + hkdf-sha-512', ok: null },
+    { label: 'ecdh p-256 key exchange', ok: null },
     { label: 'forward secrecy hash chain', ok: null },
+    { label: TOR_LABEL, ok: null },
     { label: 'encrypted relay transport', ok: null },
     { label: 'zero persistence mode', ok: null },
   ])
 
   useEffect(() => {
     async function runChecks() {
+      setChecks(prev => prev.map(c => ({ ...c, ok: null })))
       const results: { label: string; ok: boolean }[] = []
 
       const hasCrypto = typeof globalThis.crypto?.subtle?.encrypt === 'function' && typeof globalThis.crypto?.subtle?.deriveKey === 'function' && typeof globalThis.crypto?.getRandomValues === 'function'
@@ -51,6 +59,16 @@ export function Home({ onStartChat, onJoinChat }: Props) {
       } catch {}
       results.push({ label: 'aes-256-gcm + hkdf-sha-512', ok: aesOk })
 
+      let ecdhOk = false
+      try {
+        const a = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])
+        const b = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])
+        const s1 = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: b.publicKey }, a.privateKey, 256))
+        const s2 = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: a.publicKey }, b.privateKey, 256))
+        ecdhOk = s1.length === 32 && s1.every((v, i) => v === s2[i])
+      } catch {}
+      results.push({ label: 'ecdh p-256 key exchange', ok: ecdhOk })
+
       let hashChainOk = false
       try {
         const seed = crypto.getRandomValues(new Uint8Array(64))
@@ -60,23 +78,30 @@ export function Home({ onStartChat, onJoinChat }: Props) {
       } catch {}
       results.push({ label: 'forward secrecy hash chain', ok: hashChainOk })
 
+      setChecks([...results, { label: TOR_LABEL, ok: null }, { label: 'encrypted relay transport', ok: null }, { label: 'zero persistence mode', ok: null }])
+      const torOk = await detectTor()
+      results.push({ label: TOR_LABEL, ok: torOk })
+
       let relayOk = false
-      try {
-        warmUp()
-        for (let i = 0; i < 40 && !relayOk; i++) {
-          relayOk = connectedRelayCount() > 0
-          if (!relayOk) await new Promise(r => setTimeout(r, 250))
-        }
-      } catch {}
+      if (torOk) {
+        allowNetwork()
+        try {
+          warmUp()
+          for (let i = 0; i < 120 && !relayOk; i++) {
+            relayOk = connectedRelayCount() > 0
+            if (!relayOk) await new Promise(r => setTimeout(r, 250))
+          }
+        } catch {}
+      }
       results.push({ label: 'encrypted relay transport', ok: relayOk })
 
       // Read-only: confirm nothing from this app exists in any browser storage.
       let zeroPersist = false
       try {
-        const ours = (k: string | null) => !!k && /zc|zechat|sc_/i.test(k)
+        const ours = (k: string | null) => !!k && /cipherchat|cipherchat/i.test(k)
         const keysOf = (s: Storage) => Array.from({ length: s.length }, (_, i) => s.key(i))
         zeroPersist = !keysOf(localStorage).some(ours) && !keysOf(sessionStorage).some(ours)
-          && !/(^|;\s*)(zc|zechat|sc_)/i.test(document.cookie)
+          && !/(^|;\s*)(cipherchat|cipherchat)/i.test(document.cookie)
           && !('serviceWorker' in navigator && navigator.serviceWorker.controller)
       } catch {
         zeroPersist = true
@@ -86,11 +111,19 @@ export function Home({ onStartChat, onJoinChat }: Props) {
       setChecks(results)
     }
     runChecks()
-  }, [])
+  }, [runId])
 
   const valid = isValidZcashAddress(address)
   const allOk = checks.every(c => c.ok === true)
+  const torFailed = checks.find(c => c.label === TOR_LABEL)?.ok === false
   const anyFailed = checks.some(c => c.ok === false)
+
+  function copySiteLink() {
+    navigator.clipboard.writeText(location.origin + location.pathname).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 3000)
+    }).catch(() => {})
+  }
 
   return (
     <div className="view home-view">
@@ -121,16 +154,38 @@ export function Home({ onStartChat, onJoinChat }: Props) {
           <div className="terminal-line">
             {allOk
               ? <><span className="ok">[ok]</span> ready — enter shielded address<span className="cursor-blink" /></>
-              : <><span className="fail">[fail]</span> browser missing required apis</>
+              : <><span className="fail">[fail]</span> {torFailed ? 'tor required — blocked' : 'browser missing required apis'}</>
             }
           </div>
         )}
-        {anyFailed && (
+        {anyFailed && !torFailed && (
           <div className="terminal-line error-text">
             this browser does not support the required encryption apis.
           </div>
         )}
       </section>
+
+      {torFailed && (
+        <section className="card tor-gate">
+          <h3>open cipherchat inside tor</h3>
+          <p className="hint">
+            cipherchat only runs through the tor network, so no relay can ever see your ip address.
+            nothing has been sent from this page.
+          </p>
+          <ol className="tor-steps">
+            <li>install <a href="https://www.torproject.org/download/" target="_blank" rel="noopener noreferrer">tor browser</a> (desktop and android) or onion browser (ios)</li>
+            <li>copy this page's address and open it in tor browser</li>
+          </ol>
+          <div className="actions two-buttons">
+            <button onClick={copySiteLink} className="btn-primary btn-large">
+              {copied ? '[ copied ]' : '[ copy cipherchat link ]'}
+            </button>
+            <button onClick={() => setRunId(n => n + 1)} className="btn-secondary btn-large">
+              [ check again ]
+            </button>
+          </div>
+        </section>
+      )}
 
       <section className="card">
         <h2>Your Shielded Address</h2>
@@ -155,7 +210,7 @@ export function Home({ onStartChat, onJoinChat }: Props) {
           disabled={!valid || !allOk}
           className="btn-primary btn-large"
         >
-          [ start zechat ]
+          [ start cipherchat ]
         </button>
         <button
           onClick={() => onJoinChat(address.trim())}
@@ -212,7 +267,7 @@ export function Home({ onStartChat, onJoinChat }: Props) {
 
       <section className="card wallets-info">
         <p className="hint">
-          tip: use <a href="https://www.zknoir.com/" target="_blank" rel="noopener noreferrer">noir wallet</a> (chrome extension) for easy memo copy-paste in your browser.
+          invites arrive as a 20-digit code in your wallet's memo. read it from any zcash wallet and type it in here.
         </p>
       </section>
     </div>

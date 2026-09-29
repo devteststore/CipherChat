@@ -1,4 +1,4 @@
-/* ZeChat — Cypherpunk Console Theme */
+/* CipherChat — Cypherpunk Console Theme */
 
 :root {
   --bg: #030706;
@@ -153,13 +153,15 @@ main {
 
 .ascii-logo {
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: min(9px, 1.35vw);
   line-height: 1.2;
   color: var(--primary);
   text-shadow: var(--glow-text);
   white-space: pre;
   margin-bottom: 16px;
-  letter-spacing: 1px;
+  letter-spacing: 0.5px;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .hero h1 {
@@ -1297,6 +1299,17 @@ main {
 /* ── Responsive ── */
 @media (max-width: 480px) {
   .hero h1 { font-size: 22px; letter-spacing: 3px; }
-  .ascii-logo { font-size: 7px; }
+  .ascii-logo { font-size: min(7px, 1.45vw); letter-spacing: 0; }
   .message { max-width: 90%; }
 }
+
+/* Tor gate */
+.tor-gate { border-color: rgba(255, 170, 0, 0.4); }
+.tor-steps { margin: 8px 0 14px 18px; font-size: 12px; color: var(--text-dim); line-height: 1.7; }
+.tor-steps a { color: var(--primary); }
+
+/* Invite QR reveal + join approval */
+.qr-hidden { filter: blur(12px); opacity: 0.35; pointer-events: none; }
+.qr-reveal { margin-top: 6px; width: 100%; }
+.join-request { border: 1px solid rgba(255, 170, 0, 0.45); border-radius: 6px; padding: 10px; margin: 8px 0; font-size: 12px; }
+.join-request .actions { margin-top: 8px; gap: 8px; }

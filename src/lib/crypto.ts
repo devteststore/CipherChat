@@ -4,12 +4,14 @@ export interface RoomData {
   participants: string[]
   createdAt: number
   version: number
-  roomSecret: string // 512-bit hex — the actual encryption key material
+  chain: string       // base64 chain key for chainEpoch; cleared once loaded into a KeyRing
+  chainEpoch: number
 }
 
-const INVITE_INFO = new TextEncoder().encode('zechat-invite')
-const MEMO_INFO = new TextEncoder().encode('zechat-memo')
-const TRANSPORT_INFO = new TextEncoder().encode('zechat-transport')
+const INVITE_INFO = new TextEncoder().encode('cipherchat-invite')
+const MEMO_INFO = new TextEncoder().encode('cipherchat-memo')
+const SESSION_INFO = new TextEncoder().encode('cipherchat-session')
+const CHAIN_NEXT = new TextEncoder().encode('cipherchat-chain-next')
 
 async function hkdfDeriveKey(raw: Uint8Array, salt: Uint8Array, info: Uint8Array): Promise<CryptoKey> {
   const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer
@@ -46,18 +48,142 @@ async function aesDecrypt(data: Uint8Array, key: CryptoKey): Promise<Uint8Array>
   )
 }
 
-function secureWipe(arr: Uint8Array) {
+async function sha512(...parts: Uint8Array[]): Promise<Uint8Array<ArrayBuffer>> {
+  const total = parts.reduce((n, p) => n + p.length, 0)
+  const buf = new Uint8Array(total)
+  let off = 0
+  for (const p of parts) { buf.set(p, off); off += p.length }
+  const out = new Uint8Array(await crypto.subtle.digest('SHA-512', buf))
+  secureWipe(buf)
+  return out
+}
+
+export function secureWipe(arr: Uint8Array) {
   crypto.getRandomValues(arr)
   arr.fill(0)
 }
 
-// --- Room secret: 512-bit random key material ---
-export function generateRoomSecret(): string {
-  return uint8ToHex(crypto.getRandomValues(new Uint8Array(64)))
-}
-
 export function generateRoomId(): string {
   return uint8ToHex(crypto.getRandomValues(new Uint8Array(16)))
+}
+
+// --- Forward-secret message keys ---
+// Time is split into epochs. Each epoch's chain key is SHA-512 of the previous one, and
+// old chain keys are erased as time moves on, so past message keys cannot be rebuilt
+// from anything still in memory. New members receive the chain from the current
+// window only, so they cannot read anything sent before they joined.
+export const EPOCH_MS = 120_000
+const WINDOW = 3
+
+export function currentEpoch(now = Date.now()): number {
+  return Math.floor(now / EPOCH_MS)
+}
+
+export class KeyRing {
+  private chain: Uint8Array
+  private base: number
+  private keys = new Map<number, Promise<CryptoKey>>()
+  private destroyed = false
+
+  constructor(chain: Uint8Array, base: number) {
+    this.chain = chain.slice()
+    this.base = base
+  }
+
+  static create(): KeyRing {
+    const chain = crypto.getRandomValues(new Uint8Array(64))
+    const ring = new KeyRing(chain, currentEpoch() - 1)
+    secureWipe(chain)
+    return ring
+  }
+
+  static fromExport(chain: string, epoch: number): KeyRing {
+    const bytes = base64ToUint8(chain)
+    const ring = new KeyRing(bytes, epoch)
+    secureWipe(bytes)
+    return ring
+  }
+
+  get oldestEpoch(): number {
+    return this.base
+  }
+
+  epochs(): number[] {
+    return Array.from({ length: WINDOW + 1 }, (_, i) => this.base + i)
+  }
+
+  keyFor(epoch: number): Promise<CryptoKey> | null {
+    if (this.destroyed || epoch < this.base || epoch > this.base + WINDOW) return null
+    let key = this.keys.get(epoch)
+    if (!key) {
+      const start = this.chain.slice()
+      const from = this.base
+      key = (async () => {
+        let c = start
+        for (let i = from; i < epoch; i++) {
+          const n = await sha512(c, CHAIN_NEXT)
+          secureWipe(c)
+          c = n
+        }
+        const salt = await sha512(new TextEncoder().encode('cipherchat-epoch:' + epoch))
+        const k = await hkdfDeriveKey(c, salt, MEMO_INFO)
+        secureWipe(c)
+        return k
+      })()
+      this.keys.set(epoch, key)
+    }
+    return key
+  }
+
+  async advance(toBase: number): Promise<void> {
+    if (this.destroyed || toBase <= this.base) return
+    let c = this.chain.slice()
+    for (let i = this.base; i < toBase; i++) {
+      const n = await sha512(c, CHAIN_NEXT)
+      secureWipe(c)
+      c = n
+    }
+    if (this.destroyed || toBase <= this.base) { secureWipe(c); return }
+    secureWipe(this.chain)
+    this.chain = c
+    this.base = toBase
+    for (const e of [...this.keys.keys()]) if (e < toBase) this.keys.delete(e)
+  }
+
+  export(): { chain: string; epoch: number } {
+    return { chain: uint8ToBase64(this.chain), epoch: this.base }
+  }
+
+  destroy() {
+    this.destroyed = true
+    secureWipe(this.chain)
+    this.keys.clear()
+  }
+}
+
+// --- One-time key exchange for the invite handshake ---
+// Private keys are non-extractable and dropped after use, so a recorded handshake
+// cannot be decrypted later even by someone who obtains the invite code.
+export interface Ephemeral {
+  privateKey: CryptoKey
+  publicKey: string
+}
+
+export async function generateEphemeral(): Promise<Ephemeral> {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])
+  const raw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey))
+  return { privateKey: pair.privateKey, publicKey: uint8ToBase64(raw) }
+}
+
+export async function deriveSessionKey(own: CryptoKey, peerPublic: string, guestPublic: string, hostPublic: string, context: string): Promise<CryptoKey> {
+  const peerRaw = base64ToUint8(peerPublic)
+  if (peerRaw.length !== 65) throw new Error('bad public key')
+  const peer = await crypto.subtle.importKey('raw', peerRaw, { name: 'ECDH', namedCurve: 'P-256' }, false, [])
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, own, 256))
+  const salt = await sha512(new TextEncoder().encode(`cipherchat-session|${context}|${guestPublic}|${hostPublic}`))
+  const key = await hkdfDeriveKey(shared, salt, SESSION_INFO)
+  secureWipe(shared)
+  return key
 }
 
 // --- Invite code ---
@@ -103,7 +229,7 @@ export async function deriveInviteKeys(code: string, address: string): Promise<I
   const digits = normalizeInviteCode(code)
   if (!digits) throw new Error('invalid invite code')
   const salt = new Uint8Array(await crypto.subtle.digest(
-    'SHA-512', new TextEncoder().encode('zechat-invite-v1|' + normalizeAddress(address)),
+    'SHA-512', new TextEncoder().encode('cipherchat-invite-v1|' + normalizeAddress(address)),
   ))
   const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(digits), 'PBKDF2', false, ['deriveBits'])
   const bits = new Uint8Array(await crypto.subtle.deriveBits(
@@ -137,67 +263,11 @@ export async function encryptJson(value: unknown, key: CryptoKey, pad = false): 
   return uint8ToBase64(encrypted)
 }
 
-// Outer layer for room traffic, so relays do not see the key epoch.
-export async function deriveTransportKey(roomSecret: string): Promise<CryptoKey> {
-  const secretBytes = hexToUint8(roomSecret)
-  const salt = new Uint8Array(await crypto.subtle.digest('SHA-512', new TextEncoder().encode('zechat-transport-salt')))
-  const key = await hkdfDeriveKey(secretBytes, salt, TRANSPORT_INFO)
-  secureWipe(secretBytes)
-  return key
-}
-
 export async function decryptJson<T>(data: string, key: CryptoKey): Promise<T> {
   const plaintext = await aesDecrypt(base64ToUint8(data), key)
   const value = JSON.parse(new TextDecoder().decode(plaintext)) as T
   secureWipe(plaintext)
   return value
-}
-
-// --- Chat encryption with one-way key ratchet ---
-// Each epoch key is derived by hashing the previous epoch's key material.
-// Past keys cannot be re-derived once the chain advances — true forward secrecy.
-const ROTATION_INTERVAL = 10
-
-export async function deriveMemoKey(roomSecret: string, epoch: number = 0): Promise<CryptoKey> {
-  const secretBytes = hexToUint8(roomSecret)
-  const prefix = new TextEncoder().encode('zechat-room-salt:')
-  const saltInput = new Uint8Array(prefix.length + secretBytes.length)
-  saltInput.set(prefix, 0)
-  saltInput.set(secretBytes, prefix.length)
-  const roomSalt = new Uint8Array(await crypto.subtle.digest('SHA-512', saltInput))
-  secureWipe(saltInput)
-
-  const secretBuf = secretBytes.buffer.slice(secretBytes.byteOffset, secretBytes.byteOffset + secretBytes.byteLength) as ArrayBuffer
-  let chainKey = new Uint8Array(await crypto.subtle.digest('SHA-512', secretBuf))
-  for (let i = 0; i < epoch; i++) {
-    const tag = new TextEncoder().encode(`epoch:${i}`)
-    const next = new Uint8Array(chainKey.length + tag.length)
-    next.set(chainKey, 0)
-    next.set(tag, chainKey.length)
-    const prev = chainKey
-    chainKey = new Uint8Array(await crypto.subtle.digest('SHA-512', next))
-    secureWipe(prev)
-    secureWipe(next)
-  }
-
-  const key = await hkdfDeriveKey(chainKey, roomSalt, MEMO_INFO)
-  secureWipe(chainKey)
-  secureWipe(roomSalt)
-  secureWipe(secretBytes)
-  return key
-}
-
-export function getEpoch(messageCount: number): number {
-  return Math.floor(messageCount / ROTATION_INTERVAL)
-}
-
-export async function encryptMessage(text: string, memoKey: CryptoKey): Promise<Uint8Array> {
-  return aesEncrypt(new TextEncoder().encode(text), memoKey)
-}
-
-export async function decryptMessage(data: Uint8Array, memoKey: CryptoKey): Promise<string> {
-  const plaintext = await aesDecrypt(data, memoKey)
-  return new TextDecoder().decode(plaintext)
 }
 
 // --- Zcash address validation ---
@@ -212,26 +282,13 @@ export function uint8ToBase64(bytes: Uint8Array): string {
   return btoa(binary)
 }
 
-export function base64ToUint8(str: string): Uint8Array {
+export function base64ToUint8(str: string): Uint8Array<ArrayBuffer> {
   const binary = atob(str)
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
   return bytes
 }
 
-export function isParticipant(room: RoomData, address: string): boolean {
-  return room.participants.includes(address)
-}
-
 function uint8ToHex(bytes: Uint8Array): string {
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
-}
-
-function hexToUint8(hex: string): Uint8Array {
-  const clean = hex.replace(/\s/g, '')
-  const bytes = new Uint8Array(clean.length / 2)
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(clean.substr(i * 2, 2), 16)
-  }
-  return bytes
 }

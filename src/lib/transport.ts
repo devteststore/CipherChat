@@ -3,12 +3,10 @@
 // Each event is signed by a fresh throwaway key, so relays cannot link events to a person.
 import { generateSecretKey, finalizeEvent } from 'nostr-tools/pure'
 
+// Only relays verified to accept, deliver live, and NOT store or replay ephemeral events.
 export const RELAYS = [
-  'wss://relay.damus.io',
-  'wss://nos.lol',
-  'wss://relay.primal.net',
-  'wss://nostr.mom',
   'wss://relay.snort.social',
+  'wss://nostr-pub.wellorder.net',
 ]
 
 const KIND = 20455
@@ -29,7 +27,7 @@ function randomId(): string {
 }
 
 function reqFrame(sub: Sub): string {
-  return JSON.stringify(['REQ', sub.id, { kinds: [KIND], '#z': [sub.tag], since: Math.floor(Date.now() / 1000) - 10 }])
+  return JSON.stringify(['REQ', sub.id, { kinds: [KIND], '#z': [sub.tag], since: Math.floor(Date.now() / 1000) }])
 }
 
 function sendRaw(conn: Conn, frame: string) {
@@ -74,7 +72,15 @@ function scheduleReconnect(conn: Conn) {
   setTimeout(() => connect(conn), delay)
 }
 
+// No relay connection is ever opened until Tor has been confirmed, so no IP leaks.
+let networkAllowed = false
+
+export function allowNetwork() {
+  networkAllowed = true
+}
+
 function ensureConnected() {
+  if (!networkAllowed) return
   for (const url of RELAYS) {
     if (conns.has(url)) continue
     const conn: Conn = { url, ws: null, queue: [], retry: 0, closed: false }
@@ -84,6 +90,7 @@ function ensureConnected() {
 }
 
 export function publish(tag: string, content: string) {
+  if (!networkAllowed) return
   ensureConnected()
   const event = finalizeEvent(
     { kind: KIND, created_at: Math.floor(Date.now() / 1000), tags: [['z', tag]], content },
@@ -124,6 +131,6 @@ export function destroy() {
 }
 
 export async function hashChannel(roomId: string): Promise<string> {
-  const hash = await crypto.subtle.digest('SHA-512', new TextEncoder().encode('zc-ch:' + roomId))
+  const hash = await crypto.subtle.digest('SHA-512', new TextEncoder().encode('cc-ch:' + roomId))
   return Array.from(new Uint8Array(hash).slice(0, 16), b => b.toString(16).padStart(2, '0')).join('')
 }

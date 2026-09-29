@@ -47,7 +47,7 @@ export function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <button onClick={handleLeave} className="logo">ZeChat</button>
+        <button onClick={handleLeave} className="logo">CipherChat</button>
         <div className="header-right">
           <span className="network-badge mainnet">mainnet</span>
         </div>

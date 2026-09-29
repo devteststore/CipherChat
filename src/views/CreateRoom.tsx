@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { generateRoomSecret, generateRoomId } from '../lib/crypto'
+import { generateRoomId, KeyRing } from '../lib/crypto'
 import type { RoomData } from '../lib/crypto'
 
 interface Props {
@@ -16,16 +16,18 @@ export function CreateRoom({ myAddress, onCreated, onBack }: Props) {
     if (!roomName.trim()) return
     setCreating(true)
 
-    const roomSecret = generateRoomSecret()
-    const roomId = generateRoomId()
+    const ring = KeyRing.create()
+    const { chain, epoch } = ring.export()
+    ring.destroy()
 
     const room: RoomData = {
-      id: roomId,
+      id: generateRoomId(),
       name: roomName.trim(),
       participants: [myAddress],
       createdAt: Date.now(),
       version: 1,
-      roomSecret,
+      chain,
+      chainEpoch: epoch,
     }
 
     onCreated(room)
@@ -34,7 +36,7 @@ export function CreateRoom({ myAddress, onCreated, onBack }: Props) {
   return (
     <div className="view create-view">
       <button onClick={onBack} className="btn-back">back</button>
-      <h2>start zechat</h2>
+      <h2>start cipherchat</h2>
       <p className="hint" style={{ marginBottom: 16 }}>
         a private encrypted room will be created. invite others by sending them
         a wallet-locked invite via shielded zcash memo.

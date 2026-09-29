@@ -2,13 +2,16 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import type { RoomData } from '../lib/crypto'
 import {
-  deriveMemoKey, deriveTransportKey, getEpoch, isValidZcashAddress, normalizeAddress,
+  KeyRing, currentEpoch, isValidZcashAddress, normalizeAddress,
   generateInviteCode, deriveInviteKeys, encryptJson, decryptJson,
+  generateEphemeral, deriveSessionKey,
 } from '../lib/crypto'
 import { publish, subscribe, hashChannel } from '../lib/transport'
 
 const QR_PREFIX = '\x00QR:'
-const MAX_EPOCH = 100000
+const INVITE_TTL_MS = 30 * 60 * 1000
+const QR_VISIBLE_MS = 45 * 1000
+const RING_TICK_MS = 15 * 1000
 
 interface Message {
   id: string
@@ -26,23 +29,34 @@ interface WirePayload {
   ts: number
 }
 
-interface WireEnvelope {
-  e: number
-  d: string
-}
-
 export interface InviteRequest {
   t: 'req'
   n: string
+  pk: string
 }
 
 export interface InviteReply {
   t: 'room'
   n: string
+  pk: string
+  d: string
+}
+
+export interface RoomPayload {
   id: string
   name: string
-  secret: string
   participants: string[]
+  chain: string
+  epoch: number
+}
+
+interface Invite {
+  tag: string
+  key: CryptoKey
+  unsub: () => void
+  timer: ReturnType<typeof setTimeout>
+  request?: { n: string; pk: string }
+  reply?: string
 }
 
 interface Props {
@@ -82,6 +96,8 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
   const [inviteSending, setInviteSending] = useState(false)
   const [inviteError, setInviteError] = useState('')
   const [pendingInvite, setPendingInvite] = useState<{ recipient: string; code: string } | null>(null)
+  const [qrVisible, setQrVisible] = useState(false)
+  const [joinRequests, setJoinRequests] = useState<string[]>([])
   const [channelHash, setChannelHash] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -93,21 +109,30 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
   roomRef.current = room
   const onRoomUpdatedRef = useRef(onRoomUpdated)
   onRoomUpdatedRef.current = onRoomUpdated
-  const keyCache = useRef(new Map<number, Promise<CryptoKey>>())
-  const transportKey = useRef<Promise<CryptoKey> | null>(null)
-  if (!transportKey.current) transportKey.current = deriveTransportKey(room.roomSecret)
-  const sentCount = useRef(0)
-  const invites = useRef(new Map<string, () => void>())
+  const ringRef = useRef<KeyRing | null>(null)
+  if (!ringRef.current && room.chain) ringRef.current = KeyRing.fromExport(room.chain, room.chainEpoch)
+  const pendingDestroy = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const invites = useRef(new Map<string, Invite>())
 
   const myIndex = room.participants.indexOf(myAddress)
 
-  const keyFor = useCallback((epoch: number) => {
-    let p = keyCache.current.get(epoch)
-    if (!p) {
-      p = deriveMemoKey(roomRef.current.roomSecret, epoch)
-      keyCache.current.set(epoch, p)
+  // Drop the exported chain from app state once it lives only inside the ring.
+  useEffect(() => {
+    if (roomRef.current.chain) {
+      const cleared = { ...roomRef.current, chain: '' }
+      roomRef.current = cleared
+      onRoomUpdatedRef.current(cleared)
     }
-    return p
+  }, [])
+
+  useEffect(() => {
+    if (pendingDestroy.current) { clearTimeout(pendingDestroy.current); pendingDestroy.current = null }
+    const ring = ringRef.current
+    const tick = setInterval(() => { ring?.advance(currentEpoch() - 1) }, RING_TICK_MS)
+    return () => {
+      clearInterval(tick)
+      pendingDestroy.current = setTimeout(() => ring?.destroy(), 0)
+    }
   }, [])
 
   const addParticipant = useCallback((addr: string) => {
@@ -119,10 +144,12 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
   }, [])
 
   const retireInvite = useCallback((addr: string) => {
-    const unsub = invites.current.get(addr)
-    if (!unsub) return
-    unsub()
+    const inv = invites.current.get(addr)
+    if (!inv) return
+    inv.unsub()
+    clearTimeout(inv.timer)
     invites.current.delete(addr)
+    setJoinRequests(r => r.filter(a => a !== addr))
     setPendingInvite(p => (p?.recipient === addr ? null : p))
   }, [])
 
@@ -134,44 +161,58 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  useEffect(() => {
+    if (!qrVisible) return
+    const t = setTimeout(() => setQrVisible(false), QR_VISIBLE_MS)
+    return () => clearTimeout(t)
+  }, [qrVisible])
+
   const sendPayload = useCallback(async (payload: WirePayload) => {
-    const epoch = getEpoch(sentCount.current++)
-    const key = await keyFor(epoch)
-    const envelope: WireEnvelope = { e: epoch, d: await encryptJson(payload, key) }
-    publish(channelHash, await encryptJson(envelope, await transportKey.current!, true))
-  }, [channelHash, keyFor])
+    const ring = ringRef.current
+    if (!ring || !channelHash) return
+    const now = currentEpoch()
+    await ring.advance(now - 1)
+    const key = ring.keyFor(Math.max(now, ring.oldestEpoch))
+    if (!key) return
+    publish(channelHash, await encryptJson(payload, await key, true))
+  }, [channelHash])
 
   useEffect(() => {
     if (!channelHash) return
     const unsub = subscribe(channelHash, async content => {
-      try {
-        const env = await decryptJson<WireEnvelope>(content, await transportKey.current!)
-        if (!Number.isInteger(env.e) || env.e < 0 || env.e > MAX_EPOCH || typeof env.d !== 'string') return
-        const payload = await decryptJson<WirePayload>(env.d, await keyFor(env.e))
-        if (typeof payload.from !== 'string' || !isValidZcashAddress(payload.from)) return
-        if (typeof payload.id !== 'string' || typeof payload.ts !== 'number') return
-        if (payload.from === myAddress) return
+      const ring = ringRef.current
+      if (!ring) return
+      let payload: WirePayload | null = null
+      for (const e of ring.epochs()) {
+        const key = ring.keyFor(e)
+        if (!key) continue
+        try { payload = await decryptJson<WirePayload>(content, await key); break } catch { /* try next epoch */ }
+      }
+      if (!payload) return
+      if (typeof payload.from !== 'string' || !isValidZcashAddress(payload.from)) return
+      if (typeof payload.id !== 'string' || typeof payload.ts !== 'number') return
+      if (payload.from === myAddress) return
+      const p = payload
 
-        if (payload.t === 'join') {
-          addParticipant(payload.from)
-          retireInvite(payload.from)
-          setMessages(prev => prev.some(m => m.id === payload.id) ? prev : [...prev, {
-            id: payload.id, senderAddress: '', text: `${truncate(payload.from)} joined`, timestamp: payload.ts, system: true,
-          }])
-          return
-        }
+      if (p.t === 'join') {
+        addParticipant(p.from)
+        retireInvite(p.from)
+        setMessages(prev => prev.some(m => m.id === p.id) ? prev : [...prev, {
+          id: p.id, senderAddress: '', text: `${truncate(p.from)} joined`, timestamp: p.ts, system: true,
+        }])
+        return
+      }
 
-        if (payload.t === 'chat' && typeof payload.text === 'string') {
-          addParticipant(payload.from)
-          const text = payload.text.slice(0, 2000)
-          setMessages(prev => prev.some(m => m.id === payload.id) ? prev : [...prev, {
-            id: payload.id, senderAddress: payload.from, text, timestamp: payload.ts,
-          }])
-        }
-      } catch { /* not decryptable with this room's keys */ }
+      if (p.t === 'chat' && typeof p.text === 'string') {
+        addParticipant(p.from)
+        const text = p.text.slice(0, 2000)
+        setMessages(prev => prev.some(m => m.id === p.id) ? prev : [...prev, {
+          id: p.id, senderAddress: p.from, text, timestamp: p.ts,
+        }])
+      }
     })
     return unsub
-  }, [channelHash, myAddress, keyFor, addParticipant, retireInvite])
+  }, [channelHash, myAddress, addParticipant, retireInvite])
 
   useEffect(() => {
     if (!channelHash || !announceJoin) return
@@ -181,7 +222,7 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
   useEffect(() => {
     const active = invites.current
     return () => {
-      active.forEach(unsub => unsub())
+      active.forEach(inv => { inv.unsub(); clearTimeout(inv.timer) })
       active.clear()
     }
   }, [])
@@ -223,23 +264,33 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
       const { key, tag } = await deriveInviteKeys(code, addr)
 
       const unsub = subscribe(tag, async content => {
+        const inv = invites.current.get(addr)
+        if (!inv) return
         try {
           const req = await decryptJson<InviteRequest>(content, key)
-          if (req.t !== 'req' || typeof req.n !== 'string') return
-          const current = roomRef.current
-          const reply: InviteReply = {
-            t: 'room', n: req.n, id: current.id, name: current.name,
-            secret: current.roomSecret, participants: current.participants,
+          if (req.t !== 'req' || typeof req.n !== 'string' || typeof req.pk !== 'string') return
+          if (inv.reply) {
+            if (req.n === inv.request?.n) publish(tag, inv.reply)
+            return
           }
-          publish(tag, await encryptJson(reply, key, true))
+          inv.request = { n: req.n, pk: req.pk }
+          setJoinRequests(r => r.includes(addr) ? r : [...r, addr])
         } catch { /* not a request for this invite */ }
       })
-      invites.current.set(addr, unsub)
+      const timer = setTimeout(() => {
+        retireInvite(addr)
+        setMessages(prev => [...prev, {
+          id: crypto.randomUUID(), senderAddress: '', text: `invite for ${truncate(addr)} expired`,
+          timestamp: Math.floor(Date.now() / 1000), system: true,
+        }])
+      }, INVITE_TTL_MS)
+      invites.current.set(addr, { tag, key, unsub, timer })
 
       setPendingInvite({ recipient: addr, code })
+      setQrVisible(false)
       setAddingMember('')
       setMessages(prev => [...prev, {
-        id: crypto.randomUUID(), senderAddress: '', text: `invite ready for ${truncate(addr)} — keep this chat open until they join`,
+        id: crypto.randomUUID(), senderAddress: '', text: `invite ready for ${truncate(addr)} — keep this chat open until they join (expires in 30 min)`,
         timestamp: Math.floor(Date.now() / 1000), system: true,
       }])
     } catch {
@@ -249,10 +300,43 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
     }
   }
 
+  async function approveJoin(addr: string) {
+    const inv = invites.current.get(addr)
+    const ring = ringRef.current
+    if (!inv?.request || inv.reply || !ring) return
+    setJoinRequests(r => r.filter(a => a !== addr))
+    try {
+      await ring.advance(currentEpoch() - 1)
+      const eph = await generateEphemeral()
+      const sessionKey = await deriveSessionKey(eph.privateKey, inv.request.pk, inv.request.pk, eph.publicKey, inv.tag)
+      const current = roomRef.current
+      const snapshot = ring.export()
+      const payload: RoomPayload = {
+        id: current.id, name: current.name, participants: current.participants,
+        chain: snapshot.chain, epoch: snapshot.epoch,
+      }
+      const reply: InviteReply = { t: 'room', n: inv.request.n, pk: eph.publicKey, d: await encryptJson(payload, sessionKey, true) }
+      inv.reply = await encryptJson(reply, inv.key, true)
+      publish(inv.tag, inv.reply)
+      setPendingInvite(p => (p?.recipient === addr ? null : p))
+    } catch {
+      setInviteError('could not answer join request.')
+    }
+  }
+
+  function rejectJoin(addr: string) {
+    retireInvite(addr)
+    setMessages(prev => [...prev, {
+      id: crypto.randomUUID(), senderAddress: '', text: `join request for ${truncate(addr)} rejected — invite cancelled`,
+      timestamp: Math.floor(Date.now() / 1000), system: true,
+    }])
+  }
+
   function handleEndChat() {
     setMessages([])
     setInput('')
     setPendingInvite(null)
+    ringRef.current?.destroy()
     onLeave()
   }
 
@@ -309,6 +393,19 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
         </div>
       </div>
 
+      {joinRequests.map(addr => (
+        <div key={addr} className="join-request">
+          <strong>join request</strong> for the invite sent to <code>{truncate(addr)}</code>.
+          <p className="hint" style={{ margin: '6px 0 0' }}>
+            only approve if you sent that invite and are expecting them now.
+          </p>
+          <div className="actions two-buttons">
+            <button onClick={() => approveJoin(addr)} className="btn-primary btn-small">approve</button>
+            <button onClick={() => rejectJoin(addr)} className="btn-danger btn-small">reject</button>
+          </div>
+        </div>
+      ))}
+
       {showMembers && (
         <div className="members-panel">
           <h3>Members</h3>
@@ -361,13 +458,20 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
           </div>
           <div className="outgoing-recipient">
             <div className="outgoing-qr">
-              <QRCodeSVG
-                value={buildZcashUri(pendingInvite.recipient, pendingInvite.code)}
-                size={160}
-                bgColor="#ffffff"
-                fgColor="#000000"
-                level="M"
-              />
+              <div className={qrVisible ? '' : 'qr-hidden'} aria-hidden={!qrVisible}>
+                <QRCodeSVG
+                  value={qrVisible ? buildZcashUri(pendingInvite.recipient, pendingInvite.code) : 'zcash:'}
+                  size={160}
+                  bgColor="#ffffff"
+                  fgColor="#000000"
+                  level="M"
+                />
+              </div>
+              {!qrVisible && (
+                <button onClick={() => setQrVisible(true)} className="btn-secondary btn-small qr-reveal">
+                  tap to show qr
+                </button>
+              )}
             </div>
             <div className="outgoing-details">
               <div className="outgoing-field">
@@ -381,7 +485,8 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
             </div>
           </div>
           <p className="outgoing-hint">
-            scan with your zcash wallet and send. keep this chat open — they can only join while you are here.
+            make sure nobody can see or photograph your screen. the qr hides again after 45 seconds.
+            scan with your zcash wallet and send, then keep this chat open to approve them.
           </p>
         </div>
       )}
@@ -494,7 +599,7 @@ export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated
           <div className="empty-chat">
             <p>end-to-end encrypted chat active.</p>
             <p className="hint">
-              messages are encrypted with rotating keys.
+              keys change every 2 minutes and old keys are erased.
               nothing is stored — when you leave, everything is gone.
             </p>
             <span className="cursor-blink" />

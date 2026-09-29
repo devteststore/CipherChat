@@ -1,8 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import type { RoomData } from '../lib/crypto'
-import { normalizeInviteCode, deriveInviteKeys, encryptJson, decryptJson, isValidZcashAddress } from '../lib/crypto'
+import {
+  normalizeInviteCode, deriveInviteKeys, encryptJson, decryptJson, isValidZcashAddress,
+  generateEphemeral, deriveSessionKey,
+} from '../lib/crypto'
 import { publish, subscribe } from '../lib/transport'
-import type { InviteRequest, InviteReply } from './ChatRoom'
+import type { InviteRequest, InviteReply, RoomPayload } from './ChatRoom'
 
 interface Props {
   myAddress: string
@@ -11,12 +14,12 @@ interface Props {
 }
 
 const REQUEST_INTERVAL_MS = 3000
-const JOIN_TIMEOUT_MS = 90000
+const JOIN_TIMEOUT_MS = 5 * 60 * 1000
 
-function validReply(r: InviteReply): boolean {
-  return r.t === 'room'
-    && typeof r.id === 'string' && /^[0-9a-f]{32}$/.test(r.id)
-    && typeof r.secret === 'string' && /^[0-9a-f]{128}$/.test(r.secret)
+function validPayload(r: RoomPayload): boolean {
+  return typeof r.id === 'string' && /^[0-9a-f]{32}$/.test(r.id)
+    && typeof r.chain === 'string' && /^[A-Za-z0-9+/]{86}==$/.test(r.chain)
+    && Number.isInteger(r.epoch) && r.epoch > 0
     && typeof r.name === 'string'
     && Array.isArray(r.participants) && r.participants.length <= 50
     && r.participants.every(p => typeof p === 'string' && isValidZcashAddress(p))
@@ -44,8 +47,11 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
 
     try {
       const { key, tag } = await deriveInviteKeys(digits, myAddress)
+      const eph = await generateEphemeral()
       const nonce = crypto.randomUUID()
       let done = false
+      let interval: ReturnType<typeof setInterval> | undefined
+      let timeout: ReturnType<typeof setTimeout> | undefined
 
       const finish = () => {
         done = true
@@ -57,35 +63,44 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
 
       const unsub = subscribe(tag, async content => {
         if (done) return
+        let reply: InviteReply
+        try { reply = await decryptJson<InviteReply>(content, key) } catch { return }
+        if (reply.t !== 'room' || reply.n !== nonce || typeof reply.pk !== 'string' || typeof reply.d !== 'string') return
         try {
-          const reply = await decryptJson<InviteReply>(content, key)
-          if (reply.t !== 'room' || reply.n !== nonce) return
-          if (!validReply(reply)) { finish(); setError('invite reply was malformed.'); setJoining(false); setStatus(''); return }
+          const sessionKey = await deriveSessionKey(eph.privateKey, reply.pk, eph.publicKey, reply.pk, tag)
+          const room = await decryptJson<RoomPayload>(reply.d, sessionKey)
+          if (!validPayload(room)) throw new Error('malformed')
           finish()
-          const participants = reply.participants.includes(myAddress) ? reply.participants : [...reply.participants, myAddress]
+          const participants = room.participants.includes(myAddress) ? room.participants : [...room.participants, myAddress]
           onJoined({
-            id: reply.id,
-            name: reply.name.slice(0, 50) || 'ZeChat',
+            id: room.id,
+            name: room.name.slice(0, 50) || 'CipherChat',
             participants,
             createdAt: Date.now(),
             version: 1,
-            roomSecret: reply.secret,
+            chain: room.chain,
+            chainEpoch: room.epoch,
           })
-        } catch { /* our own request echoed back, or unrelated */ }
+        } catch {
+          finish()
+          setJoining(false)
+          setStatus('')
+          setError('the invite reply could not be verified.')
+        }
       })
 
-      const request: InviteRequest = { t: 'req', n: nonce }
+      const request: InviteRequest = { t: 'req', n: nonce, pk: eph.publicKey }
       const sendRequest = async () => { if (!done) publish(tag, await encryptJson(request, key, true)) }
-      setStatus('waiting for the person who invited you...')
-      const interval = setInterval(sendRequest, REQUEST_INTERVAL_MS)
+      setStatus('waiting for the person who invited you to approve...')
+      interval = setInterval(sendRequest, REQUEST_INTERVAL_MS)
       setTimeout(sendRequest, 500)
 
-      const timeout = setTimeout(() => {
+      timeout = setTimeout(() => {
         if (done) return
         finish()
         setJoining(false)
         setStatus('')
-        setError('no answer. either this code was not sent to this wallet address, or the person who invited you has closed zechat. ask them to open the chat and try again.')
+        setError('no answer. either this code was not sent to this wallet address, or the person who invited you has closed cipherchat or has not approved. ask them to open the chat and try again.')
       }, JOIN_TIMEOUT_MS)
 
       cleanup.current = finish
@@ -105,12 +120,12 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
   return (
     <div className="view join-view">
       <button onClick={onBack} className="btn-back">back</button>
-      <h2>join zechat</h2>
+      <h2>join cipherchat</h2>
 
       <div className="card">
         <label className="label">invite code</label>
         <p className="hint">
-          enter the 20-digit code from the zechat memo in your wallet.
+          enter the 20-digit code from the cipherchat memo in your wallet.
           it only works with the wallet address it was sent to.
         </p>
         <input
