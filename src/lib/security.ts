@@ -56,10 +56,17 @@ export function secureWipe(arr: Uint8Array) {
 
 // Tor Project's own onion service (from torproject.org's Onion-Location header).
 // Only a browser routed through Tor can load it; other browsers refuse .onion outright.
-const TOR_PROBE_ORIGIN = 'http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion'
+// Browsers may rewrite http:// images to https://, so both forms are probed.
+const TOR_ONION = '2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion'
+const TOR_PROBE_ORIGINS = [`http://${TOR_ONION}`, `https://${TOR_ONION}`]
 const TOR_PROBE_PATH = '/static/images/tor-logo@2x.png'
 
-export function detectTor(timeoutMs = 30000): Promise<boolean> {
+export async function detectTor(timeoutMs = 30000): Promise<boolean> {
+  const results = await Promise.all(TOR_PROBE_ORIGINS.map(o => probeImage(o + TOR_PROBE_PATH, timeoutMs)))
+  return results.some(Boolean)
+}
+
+function probeImage(url: string, timeoutMs: number): Promise<boolean> {
   return new Promise(resolve => {
     const img = new Image()
     let settled = false
@@ -75,7 +82,7 @@ export function detectTor(timeoutMs = 30000): Promise<boolean> {
     img.referrerPolicy = 'no-referrer'
     img.onload = () => done(img.naturalWidth > 0)
     img.onerror = () => done(false)
-    img.src = `${TOR_PROBE_ORIGIN}${TOR_PROBE_PATH}?${crypto.getRandomValues(new Uint32Array(1))[0]}`
+    img.src = `${url}?${crypto.getRandomValues(new Uint32Array(1))[0]}`
   })
 }
 
@@ -88,7 +95,7 @@ export function injectCSP() {
     "style-src 'self' 'unsafe-inline'",
     "font-src 'self'",
     `connect-src 'self' ${RELAYS.join(' ')}`,
-    `img-src 'self' data: ${TOR_PROBE_ORIGIN}`,
+    `img-src 'self' data: ${TOR_PROBE_ORIGINS.join(' ')}`,
     "frame-src 'none'",
     "object-src 'none'",
     "base-uri 'self'",
