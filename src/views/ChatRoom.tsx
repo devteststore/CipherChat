@@ -2,28 +2,53 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import type { RoomData } from '../lib/crypto'
 import {
-  deriveMemoKey, encryptMessage, decryptMessage,
-  uint8ToBase64, base64ToUint8,
-  encryptInviteBlob, getEpoch, isValidZcashAddress,
+  deriveMemoKey, deriveTransportKey, getEpoch, isValidZcashAddress, normalizeAddress,
+  generateInviteCode, deriveInviteKeys, encryptJson, decryptJson,
 } from '../lib/crypto'
-import { send as transportSend, subscribe as transportSubscribe, hashChannel } from '../lib/transport'
-import type { TransportEnvelope, ChatPayload } from '../lib/transport'
+import { publish, subscribe, hashChannel } from '../lib/transport'
 
 const QR_PREFIX = '\x00QR:'
+const MAX_EPOCH = 100000
 
 interface Message {
   id: string
-  senderIndex: number
   senderAddress: string
   text: string
   timestamp: number
   system?: boolean
 }
 
+interface WirePayload {
+  t: 'chat' | 'join'
+  id: string
+  from: string
+  text?: string
+  ts: number
+}
+
+interface WireEnvelope {
+  e: number
+  d: string
+}
+
+export interface InviteRequest {
+  t: 'req'
+  n: string
+}
+
+export interface InviteReply {
+  t: 'room'
+  n: string
+  id: string
+  name: string
+  secret: string
+  participants: string[]
+}
+
 interface Props {
   room: RoomData
-  roomCode: string
   myAddress: string
+  announceJoin: boolean
   onLeave: () => void
   onRoomUpdated: (room: RoomData) => void
 }
@@ -34,140 +59,201 @@ function getRole(senderIndex: number, isMe: boolean): { label: string; cls: stri
   return { label: 'guest', cls: 'role-guest' }
 }
 
-export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: Props) {
-  const [memoKey, setMemoKey] = useState<CryptoKey | null>(null)
+function toBase64Url(str: string): string {
+  const bytes = new TextEncoder().encode(str)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+// ZIP-321: memo param is base64url of the memo bytes; the memo text is the invite code.
+function buildZcashUri(address: string, memo?: string, amount?: string): string {
+  const amt = amount || '0.00001'
+  if (!memo) return `zcash:${address}?amount=${amt}`
+  return `zcash:${address}?amount=${amt}&memo=${toBase64Url(memo)}`
+}
+
+export function ChatRoom({ room, myAddress, announceJoin, onLeave, onRoomUpdated }: Props) {
   const [messages, setMessages] = useState<Message[]>([])
-  const [msgCount, setMsgCount] = useState(0)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [showMembers, setShowMembers] = useState(false)
   const [addingMember, setAddingMember] = useState('')
   const [inviteSending, setInviteSending] = useState(false)
-  const [inviteSent, setInviteSent] = useState('')
+  const [inviteError, setInviteError] = useState('')
+  const [pendingInvite, setPendingInvite] = useState<{ recipient: string; code: string } | null>(null)
+  const [channelHash, setChannelHash] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
-  const [pendingInvite, setPendingInvite] = useState<{
-    recipient: string
-    memoText: string
-  } | null>(null)
-
-  // Send ZEC flow
   const [sendZecStep, setSendZecStep] = useState<'closed' | 'amount' | 'recipient' | 'qr'>('closed')
   const [zecAmount, setZecAmount] = useState('')
   const [zecRecipient, setZecRecipient] = useState('')
 
-  const [channelHash, setChannelHash] = useState('')
+  const roomRef = useRef(room)
+  roomRef.current = room
+  const onRoomUpdatedRef = useRef(onRoomUpdated)
+  onRoomUpdatedRef.current = onRoomUpdated
+  const keyCache = useRef(new Map<number, Promise<CryptoKey>>())
+  const transportKey = useRef<Promise<CryptoKey> | null>(null)
+  if (!transportKey.current) transportKey.current = deriveTransportKey(room.roomSecret)
+  const sentCount = useRef(0)
+  const invites = useRef(new Map<string, () => void>())
+
   const myIndex = room.participants.indexOf(myAddress)
+
+  const keyFor = useCallback((epoch: number) => {
+    let p = keyCache.current.get(epoch)
+    if (!p) {
+      p = deriveMemoKey(roomRef.current.roomSecret, epoch)
+      keyCache.current.set(epoch, p)
+    }
+    return p
+  }, [])
+
+  const addParticipant = useCallback((addr: string) => {
+    const current = roomRef.current
+    if (current.participants.includes(addr)) return
+    const updated: RoomData = { ...current, participants: [...current.participants, addr], version: current.version + 1 }
+    roomRef.current = updated
+    onRoomUpdatedRef.current(updated)
+  }, [])
+
+  const retireInvite = useCallback((addr: string) => {
+    const unsub = invites.current.get(addr)
+    if (!unsub) return
+    unsub()
+    invites.current.delete(addr)
+    setPendingInvite(p => (p?.recipient === addr ? null : p))
+  }, [])
 
   useEffect(() => {
     hashChannel(room.id).then(setChannelHash)
   }, [room.id])
 
   useEffect(() => {
-    const epoch = getEpoch(msgCount)
-    deriveMemoKey(room.roomSecret, epoch).then(setMemoKey)
-  }, [room.roomSecret, msgCount])
-
-  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  const sendPayload = useCallback(async (payload: WirePayload) => {
+    const epoch = getEpoch(sentCount.current++)
+    const key = await keyFor(epoch)
+    const envelope: WireEnvelope = { e: epoch, d: await encryptJson(payload, key) }
+    publish(channelHash, await encryptJson(envelope, await transportKey.current!, true))
+  }, [channelHash, keyFor])
+
   useEffect(() => {
-    if (!channelHash || !memoKey) return
-    const unsub = transportSubscribe(async (envelope: TransportEnvelope) => {
-      if (envelope.ch !== channelHash) return
-
+    if (!channelHash) return
+    const unsub = subscribe(channelHash, async content => {
       try {
-        const outerEncrypted = base64ToUint8(envelope.data)
-        const outerPlain = await decryptMessage(outerEncrypted, memoKey)
-        const chatPayload: ChatPayload = JSON.parse(outerPlain)
+        const env = await decryptJson<WireEnvelope>(content, await transportKey.current!)
+        if (!Number.isInteger(env.e) || env.e < 0 || env.e > MAX_EPOCH || typeof env.d !== 'string') return
+        const payload = await decryptJson<WirePayload>(env.d, await keyFor(env.e))
+        if (typeof payload.from !== 'string' || !isValidZcashAddress(payload.from)) return
+        if (typeof payload.id !== 'string' || typeof payload.ts !== 'number') return
+        if (payload.from === myAddress) return
 
-        if (chatPayload.from === myAddress) return
+        if (payload.t === 'join') {
+          addParticipant(payload.from)
+          retireInvite(payload.from)
+          setMessages(prev => prev.some(m => m.id === payload.id) ? prev : [...prev, {
+            id: payload.id, senderAddress: '', text: `${truncate(payload.from)} joined`, timestamp: payload.ts, system: true,
+          }])
+          return
+        }
 
-        const msgEncrypted = base64ToUint8(chatPayload.payload)
-        const plaintext = await decryptMessage(msgEncrypted, memoKey)
-
-        const senderIdx = room.participants.indexOf(chatPayload.from)
-        setMessages(prev => {
-          if (prev.some(m => m.id === envelope.id)) return prev
-          return [...prev, {
-            id: envelope.id,
-            senderIndex: senderIdx >= 0 ? senderIdx : -1,
-            senderAddress: chatPayload.from,
-            text: plaintext,
-            timestamp: chatPayload.timestamp,
-          }]
-        })
-        setMsgCount(c => c + 1)
-      } catch { /* wrong key or not for this room */ }
+        if (payload.t === 'chat' && typeof payload.text === 'string') {
+          addParticipant(payload.from)
+          const text = payload.text.slice(0, 2000)
+          setMessages(prev => prev.some(m => m.id === payload.id) ? prev : [...prev, {
+            id: payload.id, senderAddress: payload.from, text, timestamp: payload.ts,
+          }])
+        }
+      } catch { /* not decryptable with this room's keys */ }
     })
     return unsub
-  }, [channelHash, room.participants, myAddress, memoKey])
+  }, [channelHash, myAddress, keyFor, addParticipant, retireInvite])
 
-  const handleSend = useCallback(async () => {
-    if (!input.trim() || !memoKey || myIndex === -1 || !channelHash) return
-    setSending(true)
+  useEffect(() => {
+    if (!channelHash || !announceJoin) return
+    sendPayload({ t: 'join', id: crypto.randomUUID(), from: myAddress, ts: Math.floor(Date.now() / 1000) }).catch(() => {})
+  }, [channelHash, announceJoin, myAddress, sendPayload])
 
+  useEffect(() => {
+    const active = invites.current
+    return () => {
+      active.forEach(unsub => unsub())
+      active.clear()
+    }
+  }, [])
+
+  const postMessage = useCallback(async (text: string) => {
+    if (!channelHash || myIndex === -1) return
+    const payload: WirePayload = { t: 'chat', id: crypto.randomUUID(), from: myAddress, text, ts: Math.floor(Date.now() / 1000) }
+    await sendPayload(payload)
+    setMessages(prev => [...prev, { id: payload.id, senderAddress: myAddress, text, timestamp: payload.ts }])
+  }, [channelHash, myIndex, myAddress, sendPayload])
+
+  async function handleSend() {
     const text = input.trim()
-
+    if (!text) return
+    setSending(true)
     try {
-      const encrypted = await encryptMessage(text, memoKey)
-      const encryptedB64 = uint8ToBase64(encrypted)
-      const now = Math.floor(Date.now() / 1000)
-      const msgId = crypto.randomUUID()
-
-      const chatPayload: ChatPayload = {
-        type: 'chat',
-        from: myAddress,
-        senderIndex: myIndex,
-        payload: encryptedB64,
-        timestamp: now,
-      }
-
-      const outerPlain = JSON.stringify(chatPayload)
-      const outerEncrypted = await encryptMessage(outerPlain, memoKey)
-      const outerB64 = uint8ToBase64(outerEncrypted)
-
-      transportSend({
-        id: msgId,
-        ch: channelHash,
-        data: outerB64,
-      })
-
-      setMessages(prev => [...prev, {
-        id: msgId,
-        senderIndex: myIndex,
-        senderAddress: myAddress,
-        text,
-        timestamp: now,
-      }])
-
-      setMsgCount(c => c + 1)
+      await postMessage(text)
       setInput('')
-    } catch {
-      // fail silently
-    } finally {
+    } catch { /* send failed */ } finally {
       setSending(false)
     }
-  }, [input, memoKey, myIndex, myAddress, channelHash])
-
-  function bytesToBase64(bytes: Uint8Array): string {
-    let binary = ''
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   }
 
-  function toBase64Url(str: string): string {
-    const bytes = new TextEncoder().encode(str)
-    let binary = ''
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  async function handleGiveQR() {
+    setSending(true)
+    try { await postMessage(QR_PREFIX + myAddress) } catch { /* send failed */ } finally { setSending(false) }
   }
 
-  function buildZcashUri(address: string, memo?: string, amount?: string): string {
-    const amt = amount || '0.00001'
-    if (!memo) return `zcash:${address}?amount=${amt}`
-    return `zcash:${address}?amount=${amt}&memo=${toBase64Url(memo)}`
+  async function handleInvite() {
+    const addr = normalizeAddress(addingMember)
+    setInviteError('')
+    if (!isValidZcashAddress(addr)) { setInviteError('not a valid u1 shielded address.'); return }
+    if (addr === myAddress || room.participants.includes(addr)) { setInviteError('this address is already in the chat.'); return }
+
+    setInviteSending(true)
+    try {
+      retireInvite(addr)
+      const code = generateInviteCode()
+      const { key, tag } = await deriveInviteKeys(code, addr)
+
+      const unsub = subscribe(tag, async content => {
+        try {
+          const req = await decryptJson<InviteRequest>(content, key)
+          if (req.t !== 'req' || typeof req.n !== 'string') return
+          const current = roomRef.current
+          const reply: InviteReply = {
+            t: 'room', n: req.n, id: current.id, name: current.name,
+            secret: current.roomSecret, participants: current.participants,
+          }
+          publish(tag, await encryptJson(reply, key, true))
+        } catch { /* not a request for this invite */ }
+      })
+      invites.current.set(addr, unsub)
+
+      setPendingInvite({ recipient: addr, code })
+      setAddingMember('')
+      setMessages(prev => [...prev, {
+        id: crypto.randomUUID(), senderAddress: '', text: `invite ready for ${truncate(addr)} — keep this chat open until they join`,
+        timestamp: Math.floor(Date.now() / 1000), system: true,
+      }])
+    } catch {
+      setInviteError('could not create invite.')
+    } finally {
+      setInviteSending(false)
+    }
+  }
+
+  function handleEndChat() {
+    setMessages([])
+    setInput('')
+    setPendingInvite(null)
+    onLeave()
   }
 
   function startSendZec() {
@@ -193,107 +279,6 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
     setZecRecipient('')
   }
 
-  const handleGiveQR = useCallback(async () => {
-    if (!memoKey || myIndex === -1 || !channelHash) return
-    setSending(true)
-
-    try {
-      const qrText = QR_PREFIX + myAddress
-      const encrypted = await encryptMessage(qrText, memoKey)
-      const encryptedB64 = uint8ToBase64(encrypted)
-      const now = Math.floor(Date.now() / 1000)
-      const msgId = crypto.randomUUID()
-
-      const chatPayload: ChatPayload = {
-        type: 'chat',
-        from: myAddress,
-        senderIndex: myIndex,
-        payload: encryptedB64,
-        timestamp: now,
-      }
-
-      const outerPlain = JSON.stringify(chatPayload)
-      const outerEncrypted = await encryptMessage(outerPlain, memoKey)
-      const outerB64 = uint8ToBase64(outerEncrypted)
-
-      transportSend({
-        id: msgId,
-        ch: channelHash,
-        data: outerB64,
-      })
-
-      setMessages(prev => [...prev, {
-        id: msgId,
-        senderIndex: myIndex,
-        senderAddress: myAddress,
-        text: qrText,
-        timestamp: now,
-      }])
-
-      setMsgCount(c => c + 1)
-    } catch {
-      // fail silently
-    } finally {
-      setSending(false)
-    }
-  }, [memoKey, myIndex, myAddress, channelHash])
-
-  async function handleInvite() {
-    if (!addingMember.trim()) return
-    const addr = addingMember.trim()
-    if (!isValidZcashAddress(addr)) return
-    if (room.participants.includes(addr)) return
-
-    setInviteSending(true)
-
-    try {
-      const invite = {
-        roomId: room.id,
-        roomName: room.name,
-        roomCode: roomCode,
-        roomSecret: room.roomSecret,
-      }
-      const memoBytes = await encryptInviteBlob(invite)
-      const memoText = bytesToBase64(memoBytes)
-
-      setPendingInvite({
-        recipient: addr,
-        memoText,
-      })
-
-      const updated: RoomData = {
-        ...room,
-        participants: [...room.participants, addr],
-        version: room.version + 1,
-      }
-      onRoomUpdated(updated)
-
-      setMessages(prev => [...prev, {
-        id: crypto.randomUUID(),
-        senderIndex: -1,
-        senderAddress: '',
-        text: `invite prepared for ${truncate(addr)}`,
-        timestamp: Math.floor(Date.now() / 1000),
-        system: true,
-      }])
-
-      setAddingMember('')
-      setInviteSent(truncate(addr))
-      setTimeout(() => setInviteSent(''), 3000)
-    } catch {
-      // invite failed
-    } finally {
-      setInviteSending(false)
-    }
-  }
-
-  function handleEndChat() {
-    setMessages([])
-    setInput('')
-    setPendingInvite(null)
-    onLeave()
-  }
-
   function copyToClipboard(text: string) {
     navigator.clipboard.writeText(text).then(() => {
       setTimeout(() => navigator.clipboard.writeText('').catch(() => {}), 10000)
@@ -302,13 +287,11 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
 
   return (
     <div className="view chat-view chat-active">
-      {/* Sealed bar */}
       <div className="sealed-bar">
         <span className="sealed-icon" />
         encrypted &middot; ephemeral &middot; zero persistence
       </div>
 
-      {/* Header */}
       <div className="chat-header">
         <div className="chat-header-left">
           <div>
@@ -326,13 +309,12 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
         </div>
       </div>
 
-      {/* Members panel */}
       {showMembers && (
         <div className="members-panel">
           <h3>Members</h3>
           <ul className="member-list">
             {room.participants.map((addr, i) => (
-              <li key={i} className="member-item">
+              <li key={addr} className="member-item">
                 <span className={`member-dot color-${i % 6}`} />
                 <code className="address-small">{truncate(addr)}</code>
                 {addr === myAddress && <span className="badge">you</span>}
@@ -345,7 +327,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
           <div className="invite-section">
             <h4>invite via shielded memo</h4>
             <p className="hint">
-              enter a shielded address. a wallet-locked invite will be generated.
+              enter their shielded address. the invite only works for that wallet.
             </p>
             <div className="input-group input-group-small">
               <input
@@ -366,12 +348,11 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
                 {inviteSending ? '...' : 'invite'}
               </button>
             </div>
-            {inviteSent && <p className="success-text">invite ready for {inviteSent}</p>}
+            {inviteError && <p className="error-text">{inviteError}</p>}
           </div>
         </div>
       )}
 
-      {/* Invite memo panel */}
       {pendingInvite && (
         <div className="outgoing-memo-panel">
           <div className="outgoing-memo-header">
@@ -381,40 +362,30 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
           <div className="outgoing-recipient">
             <div className="outgoing-qr">
               <QRCodeSVG
-                value={buildZcashUri(pendingInvite.recipient, pendingInvite.memoText)}
-                size={140}
+                value={buildZcashUri(pendingInvite.recipient, pendingInvite.code)}
+                size={160}
                 bgColor="#ffffff"
                 fgColor="#000000"
-                level="L"
+                level="M"
               />
             </div>
             <div className="outgoing-details">
               <div className="outgoing-field">
                 <span className="step-label">to</span>
-                <div className="outgoing-value-row">
-                  <code className="address-truncated">{truncate(pendingInvite.recipient)}</code>
-                  <button onClick={() => copyToClipboard(pendingInvite.recipient)} className="btn-copy">copy</button>
-                </div>
+                <code className="address-truncated">{truncate(pendingInvite.recipient)}</code>
               </div>
               <div className="outgoing-field">
                 <span className="step-label">amount</span>
                 <code className="outgoing-amount">0.00001 ZEC</code>
               </div>
-              <div className="outgoing-field">
-                <span className="step-label">encrypted invite</span>
-                <button onClick={() => copyToClipboard(pendingInvite.memoText)} className="btn-copy-memo">
-                  copy invite data
-                </button>
-              </div>
             </div>
           </div>
           <p className="outgoing-hint">
-            scan this qr with your zcash wallet to send the invite. shielded only.
+            scan with your zcash wallet and send. keep this chat open — they can only join while you are here.
           </p>
         </div>
       )}
 
-      {/* Send ZEC panel */}
       {sendZecStep !== 'closed' && (
         <div className="send-zec-panel">
           <div className="outgoing-memo-header">
@@ -458,11 +429,11 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
               <p className="hint">select who to send {zecAmount} ZEC to:</p>
               {room.participants
                 .filter(addr => addr !== myAddress)
-                .map((addr, i) => {
+                .map(addr => {
                   const realIdx = room.participants.indexOf(addr)
                   return (
                     <button
-                      key={i}
+                      key={addr}
                       onClick={() => selectZecRecipient(addr)}
                       className="send-zec-member-btn"
                     >
@@ -518,7 +489,6 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
         </div>
       )}
 
-      {/* Messages */}
       <div className="messages-container">
         {messages.length === 0 && (
           <div className="empty-chat">
@@ -538,14 +508,15 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
               </div>
             )
           }
-          const isMe = msg.senderIndex === myIndex
-          const role = getRole(msg.senderIndex, isMe)
+          const senderIndex = room.participants.indexOf(msg.senderAddress)
+          const isMe = msg.senderAddress === myAddress
+          const role = getRole(senderIndex, isMe)
           const isQR = msg.text.startsWith(QR_PREFIX)
           const qrAddr = isQR ? msg.text.slice(QR_PREFIX.length) : ''
           return (
             <div key={msg.id} className={`message ${isMe ? 'message-mine' : 'message-other'}`}>
               <div className="message-sender-row">
-                <span className={`message-sender color-${msg.senderIndex % 6}`}>
+                <span className={`message-sender color-${Math.max(senderIndex, 0) % 6}`}>
                   {isMe ? 'you' : truncate(msg.senderAddress)}
                 </span>
                 <span className={`message-role ${role.cls}`}>{role.label}</span>
@@ -581,7 +552,6 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input */}
       <div className="chat-input-bar">
         <button
           onClick={startSendZec}
@@ -607,7 +577,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
             placeholder="type a message..."
             className="chat-input"
-            maxLength={380}
+            maxLength={2000}
             disabled={sending}
             autoComplete="off"
             autoFocus

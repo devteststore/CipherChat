@@ -7,16 +7,9 @@ export interface RoomData {
   roomSecret: string // 512-bit hex — the actual encryption key material
 }
 
-export interface InvitePayload {
-  roomId: string
-  roomName: string
-  roomCode: string
-  roomSecret: string
-}
-
-const ROOM_INFO = new TextEncoder().encode('zechat-room')
 const INVITE_INFO = new TextEncoder().encode('zechat-invite')
 const MEMO_INFO = new TextEncoder().encode('zechat-memo')
+const TRANSPORT_INFO = new TextEncoder().encode('zechat-transport')
 
 async function hkdfDeriveKey(raw: Uint8Array, salt: Uint8Array, info: Uint8Array): Promise<CryptoKey> {
   const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer
@@ -63,63 +56,101 @@ export function generateRoomSecret(): string {
   return uint8ToHex(crypto.getRandomValues(new Uint8Array(64)))
 }
 
-// --- Room code: human-readable identifier (NOT the encryption key) ---
-export function generateRoomCode(): string {
-  const words = [
-    'shield','cipher','vault','forge','haven','nexus','prism','orbit',
-    'spark','drift','pulse','blade','storm','frost','ember','crypt',
-    'lunar','solar','delta','sigma','omega','theta','zeta','alpha',
-    'ridge','crown','flare','surge','brace','grain','stone','swift',
-    'depth','blaze','coast','quest','dune','peak','wave','arch',
-  ]
-  const picks: string[] = []
-  const bytes = crypto.getRandomValues(new Uint8Array(8))
-  for (let i = 0; i < 4; i++) {
-    // Rejection sampling to eliminate modular bias
-    let val = bytes[i]
-    while (val >= 240) val = crypto.getRandomValues(new Uint8Array(1))[0]
-    picks.push(words[val % words.length])
-  }
-  const num = ((bytes[4] << 8) | bytes[5]) % 10000
-  picks.push(num.toString().padStart(4, '0'))
-  return picks.join('-')
-}
-
 export function generateRoomId(): string {
   return uint8ToHex(crypto.getRandomValues(new Uint8Array(16)))
 }
 
-// --- Invite blob encryption ---
-// Key = HKDF(SHA-512(randomSalt), salt, info)
-// The random salt is prepended to the ciphertext so the recipient can decrypt.
-// Wallet-binding is provided by the Zcash shielded pool — only the recipient's
-// wallet can see the memo, so no address-based key derivation is needed.
-export async function encryptInviteBlob(invite: InvitePayload): Promise<Uint8Array> {
-  const inviteSalt = crypto.getRandomValues(new Uint8Array(32))
-  const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', inviteSalt))
-  const key = await hkdfDeriveKey(hash, inviteSalt, INVITE_INFO)
-  const compact = JSON.stringify({ i: invite.roomId, n: invite.roomName, c: invite.roomCode, s: invite.roomSecret })
-  const plaintext = new TextEncoder().encode(compact)
-  const encrypted = await aesEncrypt(plaintext, key)
-  secureWipe(hash)
-  secureWipe(plaintext)
-  const blob = new Uint8Array(32 + encrypted.length)
-  blob.set(inviteSalt, 0)
-  blob.set(encrypted, 32)
-  secureWipe(inviteSalt)
-  return blob
+// --- Invite code ---
+// The memo carries only a 20-digit code: digits survive wallet font substitution.
+// Key and relay channel are derived from code + recipient address, so the code is
+// useless with any other wallet address. PBKDF2 makes guessing the code expensive.
+const INVITE_CODE_DIGITS = 20
+const INVITE_PBKDF2_ITERATIONS = 310000
+
+export interface InviteKeys {
+  key: CryptoKey
+  tag: string
 }
 
-export async function decryptInviteBlob(data: Uint8Array): Promise<InvitePayload> {
-  const inviteSalt = data.slice(0, 32)
-  const encrypted = data.slice(32)
-  const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', inviteSalt))
-  const key = await hkdfDeriveKey(hash, inviteSalt, INVITE_INFO)
-  const plaintext = await aesDecrypt(encrypted, key)
-  const compact = JSON.parse(new TextDecoder().decode(plaintext))
-  secureWipe(hash)
+export function generateInviteCode(): string {
+  const digits: number[] = []
+  while (digits.length < INVITE_CODE_DIGITS) {
+    for (const b of crypto.getRandomValues(new Uint8Array(32))) {
+      if (b < 250 && digits.length < INVITE_CODE_DIGITS) digits.push(b % 10)
+    }
+  }
+  return formatInviteCode(digits.join(''))
+}
+
+export function formatInviteCode(digits: string): string {
+  return digits.match(/.{1,4}/g)!.join('-')
+}
+
+// Wallet fonts can turn 0 into O and 1 into l/I; map those back, drop everything else.
+export function normalizeInviteCode(input: string): string | null {
+  const digits = input
+    .replace(/[OoОоΟο]/g, '0')
+    .replace(/[IlІ|]/g, '1')
+    .replace(/[^0-9]/g, '')
+  return digits.length === INVITE_CODE_DIGITS ? digits : null
+}
+
+export function normalizeAddress(address: string): string {
+  return address.trim().toLowerCase()
+}
+
+export async function deriveInviteKeys(code: string, address: string): Promise<InviteKeys> {
+  const digits = normalizeInviteCode(code)
+  if (!digits) throw new Error('invalid invite code')
+  const salt = new Uint8Array(await crypto.subtle.digest(
+    'SHA-512', new TextEncoder().encode('zechat-invite-v1|' + normalizeAddress(address)),
+  ))
+  const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(digits), 'PBKDF2', false, ['deriveBits'])
+  const bits = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: INVITE_PBKDF2_ITERATIONS, hash: 'SHA-512' }, material, 512,
+  ))
+  const key = await hkdfDeriveKey(bits.slice(0, 32), salt, INVITE_INFO)
+  const tagHash = new Uint8Array(await crypto.subtle.digest('SHA-256', bits.slice(32)))
+  const tag = uint8ToHex(tagHash.slice(0, 16))
+  secureWipe(bits)
+  secureWipe(tagHash)
+  return { key, tag }
+}
+
+// Padding hides message length from relays. JSON.parse ignores trailing spaces.
+const PAD_BUCKETS = [512, 2048, 8192, 16384]
+
+function padToBucket(bytes: Uint8Array): Uint8Array {
+  const size = PAD_BUCKETS.find(b => b >= bytes.length) ?? bytes.length
+  if (size === bytes.length) return bytes
+  const out = new Uint8Array(size).fill(0x20)
+  out.set(bytes, 0)
+  secureWipe(bytes)
+  return out
+}
+
+export async function encryptJson(value: unknown, key: CryptoKey, pad = false): Promise<string> {
+  let plaintext: Uint8Array = new TextEncoder().encode(JSON.stringify(value))
+  if (pad) plaintext = padToBucket(plaintext)
+  const encrypted = await aesEncrypt(plaintext, key)
   secureWipe(plaintext)
-  return { roomId: compact.i, roomName: compact.n, roomCode: compact.c, roomSecret: compact.s }
+  return uint8ToBase64(encrypted)
+}
+
+// Outer layer for room traffic, so relays do not see the key epoch.
+export async function deriveTransportKey(roomSecret: string): Promise<CryptoKey> {
+  const secretBytes = hexToUint8(roomSecret)
+  const salt = new Uint8Array(await crypto.subtle.digest('SHA-512', new TextEncoder().encode('zechat-transport-salt')))
+  const key = await hkdfDeriveKey(secretBytes, salt, TRANSPORT_INFO)
+  secureWipe(secretBytes)
+  return key
+}
+
+export async function decryptJson<T>(data: string, key: CryptoKey): Promise<T> {
+  const plaintext = await aesDecrypt(base64ToUint8(data), key)
+  const value = JSON.parse(new TextDecoder().decode(plaintext)) as T
+  secureWipe(plaintext)
+  return value
 }
 
 // --- Chat encryption with one-way key ratchet ---

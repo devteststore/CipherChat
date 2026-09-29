@@ -4,6 +4,8 @@ import { CreateRoom } from './views/CreateRoom'
 import { JoinRoom } from './views/JoinRoom'
 import { ChatRoom } from './views/ChatRoom'
 import type { RoomData } from './lib/crypto'
+import { normalizeAddress } from './lib/crypto'
+import { destroy as closeTransport } from './lib/transport'
 
 type View = 'home' | 'create' | 'join' | 'chat'
 
@@ -11,34 +13,34 @@ export function App() {
   const [view, setView] = useState<View>('home')
   const [myAddress, setMyAddress] = useState('')
   const [activeRoom, setActiveRoom] = useState<RoomData | null>(null)
-  const [roomCode, setRoomCode] = useState('')
+  const [joined, setJoined] = useState(false)
 
   const handleStartChat = useCallback((address: string) => {
-    setMyAddress(address)
+    setMyAddress(normalizeAddress(address))
     setView('create')
   }, [])
 
   const handleJoinChat = useCallback((address: string) => {
-    setMyAddress(address)
+    setMyAddress(normalizeAddress(address))
     setView('join')
   }, [])
 
-  const handleRoomCreated = useCallback((room: RoomData, code: string) => {
+  const handleRoomCreated = useCallback((room: RoomData) => {
     setActiveRoom(room)
-    setRoomCode(code)
+    setJoined(false)
     setView('chat')
   }, [])
 
-  const handleRoomJoined = useCallback((room: RoomData, code: string) => {
+  const handleRoomJoined = useCallback((room: RoomData) => {
     setActiveRoom(room)
-    setRoomCode(code)
+    setJoined(true)
     setView('chat')
   }, [])
 
   const handleLeave = useCallback(() => {
-    // Flush everything — zero trace
+    closeTransport()
     setActiveRoom(null)
-    setRoomCode('')
+    setJoined(false)
     setView('home')
   }, [])
 
@@ -71,8 +73,8 @@ export function App() {
         {view === 'chat' && activeRoom && (
           <ChatRoom
             room={activeRoom}
-            roomCode={roomCode}
             myAddress={myAddress}
+            announceJoin={joined}
             onLeave={handleLeave}
             onRoomUpdated={setActiveRoom}
           />

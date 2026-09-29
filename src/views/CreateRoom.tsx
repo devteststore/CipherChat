@@ -1,10 +1,10 @@
 import { useState } from 'react'
-import { generateRoomCode, generateRoomSecret, generateRoomId } from '../lib/crypto'
+import { generateRoomSecret, generateRoomId } from '../lib/crypto'
 import type { RoomData } from '../lib/crypto'
 
 interface Props {
   myAddress: string
-  onCreated: (room: RoomData, roomCode: string) => void
+  onCreated: (room: RoomData) => void
   onBack: () => void
 }
 
@@ -16,7 +16,6 @@ export function CreateRoom({ myAddress, onCreated, onBack }: Props) {
     if (!roomName.trim()) return
     setCreating(true)
 
-    const code = generateRoomCode()
     const roomSecret = generateRoomSecret()
     const roomId = generateRoomId()
 
@@ -29,7 +28,7 @@ export function CreateRoom({ myAddress, onCreated, onBack }: Props) {
       roomSecret,
     }
 
-    onCreated(room, code)
+    onCreated(room)
   }
 
   return (

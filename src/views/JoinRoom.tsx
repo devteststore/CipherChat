@@ -1,121 +1,105 @@
-import { useState } from 'react'
-import type { RoomData, InvitePayload } from '../lib/crypto'
-import { decryptInviteBlob } from '../lib/crypto'
+import { useState, useEffect, useRef } from 'react'
+import type { RoomData } from '../lib/crypto'
+import { normalizeInviteCode, deriveInviteKeys, encryptJson, decryptJson, isValidZcashAddress } from '../lib/crypto'
+import { publish, subscribe } from '../lib/transport'
+import type { InviteRequest, InviteReply } from './ChatRoom'
 
 interface Props {
   myAddress: string
-  onJoined: (room: RoomData, roomCode: string) => void
+  onJoined: (room: RoomData) => void
   onBack: () => void
 }
 
-function b64Decode(input: string): Uint8Array {
-  const b64 = input.replace(/-/g, '+').replace(/_/g, '/')
-  const padded = b64 + '='.repeat((4 - b64.length % 4) % 4)
-  const binary = atob(padded)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-  return bytes
-}
+const REQUEST_INTERVAL_MS = 3000
+const JOIN_TIMEOUT_MS = 90000
 
-function stripNonBase64(s: string): string {
-  return s.replace(/[^A-Za-z0-9\-_+/=]/g, '')
+function validReply(r: InviteReply): boolean {
+  return r.t === 'room'
+    && typeof r.id === 'string' && /^[0-9a-f]{32}$/.test(r.id)
+    && typeof r.secret === 'string' && /^[0-9a-f]{128}$/.test(r.secret)
+    && typeof r.name === 'string'
+    && Array.isArray(r.participants) && r.participants.length <= 50
+    && r.participants.every(p => typeof p === 'string' && isValidZcashAddress(p))
 }
 
 export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
-  const [memoInput, setMemoInput] = useState('')
+  const [codeInput, setCodeInput] = useState('')
   const [error, setError] = useState('')
-  const [diag, setDiag] = useState('')
+  const [status, setStatus] = useState('')
   const [joining, setJoining] = useState(false)
+  const cleanup = useRef<(() => void) | null>(null)
 
-  function joinWithInvite(invite: InvitePayload) {
-    if (
-      typeof invite.roomId !== 'string' || invite.roomId.length < 16 ||
-      typeof invite.roomSecret !== 'string' || invite.roomSecret.length < 64 ||
-      typeof invite.roomCode !== 'string' || !invite.roomCode
-    ) {
-      setError('invalid invite payload. the data may be corrupted.')
-      setJoining(false)
+  useEffect(() => () => cleanup.current?.(), [])
+
+  async function handleJoin() {
+    const digits = normalizeInviteCode(codeInput)
+    setError('')
+    if (!digits) {
+      setError('the invite code is 20 digits. check you copied all of it from the memo.')
       return
     }
+    setCodeInput('')
+    setJoining(true)
+    setStatus('deriving wallet-locked key...')
 
-    const safeName = typeof invite.roomName === 'string'
-      ? invite.roomName.slice(0, 50)
-      : 'ZeChat'
+    try {
+      const { key, tag } = await deriveInviteKeys(digits, myAddress)
+      const nonce = crypto.randomUUID()
+      let done = false
 
-    const room: RoomData = {
-      id: invite.roomId,
-      name: safeName,
-      participants: [myAddress],
-      createdAt: Date.now(),
-      version: 1,
-      roomSecret: invite.roomSecret,
+      const finish = () => {
+        done = true
+        clearInterval(interval)
+        clearTimeout(timeout)
+        unsub()
+        cleanup.current = null
+      }
+
+      const unsub = subscribe(tag, async content => {
+        if (done) return
+        try {
+          const reply = await decryptJson<InviteReply>(content, key)
+          if (reply.t !== 'room' || reply.n !== nonce) return
+          if (!validReply(reply)) { finish(); setError('invite reply was malformed.'); setJoining(false); setStatus(''); return }
+          finish()
+          const participants = reply.participants.includes(myAddress) ? reply.participants : [...reply.participants, myAddress]
+          onJoined({
+            id: reply.id,
+            name: reply.name.slice(0, 50) || 'ZeChat',
+            participants,
+            createdAt: Date.now(),
+            version: 1,
+            roomSecret: reply.secret,
+          })
+        } catch { /* our own request echoed back, or unrelated */ }
+      })
+
+      const request: InviteRequest = { t: 'req', n: nonce }
+      const sendRequest = async () => { if (!done) publish(tag, await encryptJson(request, key, true)) }
+      setStatus('waiting for the person who invited you...')
+      const interval = setInterval(sendRequest, REQUEST_INTERVAL_MS)
+      setTimeout(sendRequest, 500)
+
+      const timeout = setTimeout(() => {
+        if (done) return
+        finish()
+        setJoining(false)
+        setStatus('')
+        setError('no answer. either this code was not sent to this wallet address, or the person who invited you has closed zechat. ask them to open the chat and try again.')
+      }, JOIN_TIMEOUT_MS)
+
+      cleanup.current = finish
+    } catch {
+      setJoining(false)
+      setStatus('')
+      setError('could not start join.')
     }
-
-    onJoined(room, invite.roomCode)
   }
 
-  async function handleDecryptInvite() {
-    if (!memoInput.trim()) return
-    setJoining(true)
-    setError('')
-    setDiag('')
-
-    const dbg: string[] = []
-    try {
-      const raw = memoInput.trim()
-      dbg.push(`pasted: ${raw.length} chars`)
-      const cleaned = stripNonBase64(raw)
-      dbg.push(`cleaned: ${cleaned.length} chars`)
-
-      if (cleaned.length < 80) {
-        setError('memo too short.')
-        setDiag(dbg.join(' | '))
-        setJoining(false)
-        return
-      }
-
-      let firstBytes: Uint8Array
-      try {
-        firstBytes = b64Decode(cleaned)
-        dbg.push(`decoded: ${firstBytes.length} bytes`)
-      } catch {
-        setError('base64 decode failed.')
-        setDiag(dbg.join(' | '))
-        setJoining(false)
-        return
-      }
-
-      let firstErr = ''
-      try {
-        const invite = await decryptInviteBlob(firstBytes)
-        joinWithInvite(invite)
-        return
-      } catch (e) { firstErr = (e as Error).message || 'aes-gcm fail' }
-      dbg.push(`try1: ${firstErr}`)
-
-      let secondErr = ''
-      try {
-        const innerText = new TextDecoder('utf-8', { fatal: false }).decode(firstBytes)
-        const innerCleaned = stripNonBase64(innerText)
-        dbg.push(`inner: ${innerCleaned.length} chars`)
-        if (innerCleaned.length >= 80) {
-          const innerBytes = b64Decode(innerCleaned)
-          dbg.push(`inner-decoded: ${innerBytes.length} bytes`)
-          const invite = await decryptInviteBlob(innerBytes)
-          joinWithInvite(invite)
-          return
-        }
-      } catch (e) { secondErr = (e as Error).message || 'aes-gcm fail' }
-      dbg.push(`try2: ${secondErr || 'skipped'}`)
-
-      setError('decrypt failed — see diagnostics below')
-      setDiag(dbg.join(' | '))
-      setJoining(false)
-    } catch (e) {
-      setError((e as Error).message || 'unknown error')
-      setDiag(dbg.join(' | '))
-      setJoining(false)
-    }
+  function handleCancel() {
+    cleanup.current?.()
+    setJoining(false)
+    setStatus('')
   }
 
   return (
@@ -124,40 +108,45 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
       <h2>join zechat</h2>
 
       <div className="card">
-        <label className="label">paste invite memo</label>
+        <label className="label">invite code</label>
         <p className="hint">
-          open your zcash wallet, find the zechat invite memo, and paste it below.
-          only your wallet can decrypt it.
+          enter the 20-digit code from the zechat memo in your wallet.
+          it only works with the wallet address it was sent to.
         </p>
-        <textarea
-          value={memoInput}
-          onChange={e => setMemoInput(e.target.value)}
-          placeholder="paste your invite memo here..."
-          className="input-memo-paste"
-          rows={6}
+        <input
+          type="password"
+          value={codeInput}
+          onChange={e => setCodeInput(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && !joining && handleJoin()}
+          placeholder="0000-0000-0000-0000-0000"
+          className="input-full"
+          inputMode="numeric"
           spellCheck={false}
           autoComplete="off"
+          data-lpignore="true"
+          data-1p-ignore="true"
+          disabled={joining}
           autoFocus
         />
       </div>
 
       {error && <p className="error-text">{error}</p>}
-      {diag && <p className="hint" style={{ fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{diag}</p>}
+      {status && <p className="hint">{status}</p>}
 
       <div className="actions">
-        <button
-          onClick={handleDecryptInvite}
-          disabled={joining || !memoInput.trim()}
-          className="btn-primary btn-large"
-        >
-          {joining ? '[ decrypting... ]' : '[ decrypt & join ]'}
-        </button>
+        {joining ? (
+          <button onClick={handleCancel} className="btn-secondary btn-large">[ cancel ]</button>
+        ) : (
+          <button onClick={handleJoin} disabled={!codeInput.trim()} className="btn-primary btn-large">
+            [ join ]
+          </button>
+        )}
       </div>
 
       <div className="card info-card">
         <p className="hint">
-          invites are encrypted and delivered via shielded memo.
-          paste the full memo to join.
+          the code never leaves this page. it is combined with your wallet address
+          to unlock the invite, so it is useless to anyone else.
         </p>
       </div>
     </div>

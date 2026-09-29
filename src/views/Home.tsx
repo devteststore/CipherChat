@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { config } from '../config'
 import { isValidZcashAddress } from '../lib/crypto'
+import { warmUp, connectedRelayCount } from '../lib/transport'
 
 interface Props {
   onStartChat: (address: string) => void
@@ -21,7 +22,7 @@ export function Home({ onStartChat, onJoinChat }: Props) {
     { label: 'webcrypto engine', ok: null },
     { label: 'aes-256-gcm + hkdf-sha-512', ok: null },
     { label: 'forward secrecy hash chain', ok: null },
-    { label: 'broadcastchannel transport', ok: null },
+    { label: 'encrypted relay transport', ok: null },
     { label: 'zero persistence mode', ok: null },
   ])
 
@@ -59,21 +60,24 @@ export function Home({ onStartChat, onJoinChat }: Props) {
       } catch {}
       results.push({ label: 'forward secrecy hash chain', ok: hashChainOk })
 
-      let bcOk = false
+      let relayOk = false
       try {
-        const ch = new BroadcastChannel('__sc_probe__')
-        ch.close()
-        bcOk = true
+        warmUp()
+        for (let i = 0; i < 40 && !relayOk; i++) {
+          relayOk = connectedRelayCount() > 0
+          if (!relayOk) await new Promise(r => setTimeout(r, 250))
+        }
       } catch {}
-      results.push({ label: 'broadcastchannel transport', ok: bcOk })
+      results.push({ label: 'encrypted relay transport', ok: relayOk })
 
-      const noStorage = typeof localStorage !== 'undefined' && typeof sessionStorage !== 'undefined'
+      // Read-only: confirm nothing from this app exists in any browser storage.
       let zeroPersist = false
       try {
-        const testKey = '__sc_zero_persist_check__'
-        localStorage.setItem(testKey, '1')
-        localStorage.removeItem(testKey)
-        zeroPersist = noStorage && !document.cookie.includes('sc_')
+        const ours = (k: string | null) => !!k && /zc|zechat|sc_/i.test(k)
+        const keysOf = (s: Storage) => Array.from({ length: s.length }, (_, i) => s.key(i))
+        zeroPersist = !keysOf(localStorage).some(ours) && !keysOf(sessionStorage).some(ours)
+          && !/(^|;\s*)(zc|zechat|sc_)/i.test(document.cookie)
+          && !('serviceWorker' in navigator && navigator.serviceWorker.controller)
       } catch {
         zeroPersist = true
       }
@@ -176,14 +180,14 @@ export function Home({ onStartChat, onJoinChat }: Props) {
             <span className="step-num">2</span>
             <div>
               <strong>start or join a chat</strong>
-              <p>create a new room, or paste an invite from a shielded memo.</p>
+              <p>create a new room, or enter the invite code from your shielded memo.</p>
             </div>
           </div>
           <div className="step">
             <span className="step-num">3</span>
             <div>
               <strong>invite via shielded memo</strong>
-              <p>invites are wallet-locked encrypted blobs sent on-chain.</p>
+              <p>a short code sent on-chain, locked to the invited wallet.</p>
             </div>
           </div>
           <div className="step">
@@ -207,22 +211,9 @@ export function Home({ onStartChat, onJoinChat }: Props) {
       </section>
 
       <section className="card wallets-info">
-        <h3>Recommended Wallets</h3>
-        <p className="hint">use any zcash wallet that supports shielded memos.</p>
-        <div className="wallet-list">
-          <a href="https://myzodl.com" target="_blank" rel="noopener noreferrer" className="wallet-card">
-            <strong>Zodl</strong>
-            <span>web &amp; mobile — formerly zashi, built by the original ecc team</span>
-          </a>
-          <a href="https://cakewallet.com" target="_blank" rel="noopener noreferrer" className="wallet-card">
-            <strong>Cake Wallet</strong>
-            <span>mobile — autoshielding, full shielded memo support</span>
-          </a>
-          <a href="https://vizorwallet.com" target="_blank" rel="noopener noreferrer" className="wallet-card">
-            <strong>Vizor</strong>
-            <span>desktop — macos, windows, linux — by chainapsis (keplr team)</span>
-          </a>
-        </div>
+        <p className="hint">
+          tip: use <a href="https://www.zknoir.com/" target="_blank" rel="noopener noreferrer">noir wallet</a> (chrome extension) for easy memo copy-paste in your browser.
+        </p>
       </section>
     </div>
   )

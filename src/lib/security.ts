@@ -1,3 +1,5 @@
+import { RELAYS } from './transport'
+
 export function initSecurityHardening() {
   document.addEventListener('contextmenu', e => {
     const target = e.target as HTMLElement
@@ -60,7 +62,7 @@ export function injectCSP() {
     "script-src 'self'",
     "style-src 'self' 'unsafe-inline'",
     "font-src 'self'",
-    "connect-src 'self'",
+    `connect-src 'self' ${RELAYS.join(' ')}`,
     "img-src 'self' data:",
     "frame-src 'none'",
     "object-src 'none'",
