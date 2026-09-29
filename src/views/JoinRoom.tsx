@@ -42,9 +42,9 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
 
       let invite
       try {
-        invite = await decryptInviteBlob(data, myAddress)
+        invite = await decryptInviteBlob(data)
       } catch {
-        setError('this invite is not for your wallet. only the authorized address can decrypt it.')
+        setError('failed to decrypt invite. the data may be corrupted or incomplete.')
         setJoining(false)
         return
       }

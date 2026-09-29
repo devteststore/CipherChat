@@ -253,7 +253,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
         roomCode: roomCode,
         roomSecret: room.roomSecret,
       }
-      const memoBytes = await encryptInviteBlob(invite, addr)
+      const memoBytes = await encryptInviteBlob(invite)
       const memoText = bytesToBase64(memoBytes)
 
       setPendingInvite({

@@ -90,21 +90,17 @@ export function generateRoomId(): string {
 }
 
 // --- Invite blob encryption ---
-// Key = HKDF(SHA256(recipientAddress + randomSalt), salt, info)
+// Key = HKDF(SHA-512(randomSalt), salt, info)
 // The random salt is prepended to the ciphertext so the recipient can decrypt.
-// Without knowing the recipient's address, the blob is unreadable.
-export async function encryptInviteBlob(invite: InvitePayload, recipientAddress: string): Promise<Uint8Array> {
+// Wallet-binding is provided by the Zcash shielded pool — only the recipient's
+// wallet can see the memo, so no address-based key derivation is needed.
+export async function encryptInviteBlob(invite: InvitePayload): Promise<Uint8Array> {
   const inviteSalt = crypto.getRandomValues(new Uint8Array(32))
-  const seed = new TextEncoder().encode(recipientAddress)
-  const combined = new Uint8Array(seed.length + inviteSalt.length)
-  combined.set(seed, 0)
-  combined.set(inviteSalt, seed.length)
-  const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', combined))
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', inviteSalt))
   const key = await hkdfDeriveKey(hash, inviteSalt, INVITE_INFO)
   const compact = JSON.stringify({ i: invite.roomId, n: invite.roomName, c: invite.roomCode, s: invite.roomSecret })
   const plaintext = new TextEncoder().encode(compact)
   const encrypted = await aesEncrypt(plaintext, key)
-  secureWipe(combined)
   secureWipe(hash)
   secureWipe(plaintext)
   const blob = new Uint8Array(32 + encrypted.length)
@@ -114,18 +110,13 @@ export async function encryptInviteBlob(invite: InvitePayload, recipientAddress:
   return blob
 }
 
-export async function decryptInviteBlob(data: Uint8Array, myAddress: string): Promise<InvitePayload> {
+export async function decryptInviteBlob(data: Uint8Array): Promise<InvitePayload> {
   const inviteSalt = data.slice(0, 32)
   const encrypted = data.slice(32)
-  const seed = new TextEncoder().encode(myAddress)
-  const combined = new Uint8Array(seed.length + inviteSalt.length)
-  combined.set(seed, 0)
-  combined.set(inviteSalt, seed.length)
-  const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', combined))
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', inviteSalt))
   const key = await hkdfDeriveKey(hash, inviteSalt, INVITE_INFO)
   const plaintext = await aesDecrypt(encrypted, key)
   const compact = JSON.parse(new TextDecoder().decode(plaintext))
-  secureWipe(combined)
   secureWipe(hash)
   secureWipe(plaintext)
   return { roomId: compact.i, roomName: compact.n, roomCode: compact.c, roomSecret: compact.s }
