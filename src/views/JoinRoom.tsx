@@ -24,6 +24,7 @@ function stripNonBase64(s: string): string {
 export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
   const [memoInput, setMemoInput] = useState('')
   const [error, setError] = useState('')
+  const [diag, setDiag] = useState('')
   const [joining, setJoining] = useState(false)
 
   function joinWithInvite(invite: InvitePayload) {
@@ -57,13 +58,18 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
     if (!memoInput.trim()) return
     setJoining(true)
     setError('')
+    setDiag('')
 
+    const dbg: string[] = []
     try {
       const raw = memoInput.trim()
+      dbg.push(`pasted: ${raw.length} chars`)
       const cleaned = stripNonBase64(raw)
+      dbg.push(`cleaned: ${cleaned.length} chars`)
 
       if (cleaned.length < 80) {
-        setError('memo too short. make sure you copied the complete memo from your wallet.')
+        setError('memo too short.')
+        setDiag(dbg.join(' | '))
         setJoining(false)
         return
       }
@@ -71,36 +77,43 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
       let firstBytes: Uint8Array
       try {
         firstBytes = b64Decode(cleaned)
+        dbg.push(`decoded: ${firstBytes.length} bytes`)
       } catch {
-        setError('invalid invite data. paste the memo exactly as shown in your wallet.')
+        setError('base64 decode failed.')
+        setDiag(dbg.join(' | '))
         setJoining(false)
         return
       }
 
-      // Try direct: pasted text is base64url of the raw encrypted bytes
+      let firstErr = ''
       try {
         const invite = await decryptInviteBlob(firstBytes)
         joinWithInvite(invite)
         return
-      } catch {}
+      } catch (e) { firstErr = (e as Error).message || 'aes-gcm fail' }
+      dbg.push(`try1: ${firstErr}`)
 
-      // Try double-decode: pasted text may be base64url of base64url text
-      // (wallet stored the URI memo param as-is without decoding)
+      let secondErr = ''
       try {
-        const innerText = new TextDecoder().decode(firstBytes)
+        const innerText = new TextDecoder('utf-8', { fatal: false }).decode(firstBytes)
         const innerCleaned = stripNonBase64(innerText)
+        dbg.push(`inner: ${innerCleaned.length} chars`)
         if (innerCleaned.length >= 80) {
           const innerBytes = b64Decode(innerCleaned)
+          dbg.push(`inner-decoded: ${innerBytes.length} bytes`)
           const invite = await decryptInviteBlob(innerBytes)
           joinWithInvite(invite)
           return
         }
-      } catch {}
+      } catch (e) { secondErr = (e as Error).message || 'aes-gcm fail' }
+      dbg.push(`try2: ${secondErr || 'skipped'}`)
 
-      setError('failed to decrypt invite. make sure you copied the complete memo and entered the correct wallet address.')
+      setError('decrypt failed — see diagnostics below')
+      setDiag(dbg.join(' | '))
       setJoining(false)
-    } catch {
-      setError('failed to decrypt. this may not be a valid zechat invite.')
+    } catch (e) {
+      setError((e as Error).message || 'unknown error')
+      setDiag(dbg.join(' | '))
       setJoining(false)
     }
   }
@@ -129,6 +142,7 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
       </div>
 
       {error && <p className="error-text">{error}</p>}
+      {diag && <p className="hint" style={{ fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all' }}>{diag}</p>}
 
       <div className="actions">
         <button
