@@ -48,8 +48,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
 
   const [pendingInvite, setPendingInvite] = useState<{
     recipient: string
-    memoHex: string
-    memoText: string
+    memoBytes: Uint8Array
   } | null>(null)
 
   // Send ZEC flow
@@ -152,12 +151,11 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
     }
   }, [input, memoKey, myIndex, myAddress, channelHash])
 
-  function buildZcashUri(address: string, memoText: string, amount?: string): string {
+  function buildZcashUri(address: string, memo?: Uint8Array, amount?: string): string {
     const amt = amount || '0.00001'
-    if (!memoText) return `zcash:${address}?amount=${amt}`
-    const memoBytes = new TextEncoder().encode(memoText)
+    if (!memo) return `zcash:${address}?amount=${amt}`
     let binary = ''
-    for (let i = 0; i < memoBytes.length; i++) binary += String.fromCharCode(memoBytes[i])
+    for (let i = 0; i < memo.length; i++) binary += String.fromCharCode(memo[i])
     const memoB64url = btoa(binary)
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
     return `zcash:${address}?amount=${amt}&memo=${memoB64url}`
@@ -244,15 +242,12 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
         roomName: room.name,
         roomCode: roomCode,
         roomSecret: room.roomSecret,
-        invitedBy: truncate(myAddress),
       }
-      const encryptedBlob = await encryptInviteBlob(invite, addr)
-      const inviteMemoText = `ZeChat Invite\nCopy the below into ZeChat to join.\n---\n${encryptedBlob}`
+      const memoBytes = await encryptInviteBlob(invite, addr)
 
       setPendingInvite({
         recipient: addr,
-        memoHex: encryptedBlob,
-        memoText: inviteMemoText,
+        memoBytes,
       })
 
       const updated: RoomData = {
@@ -375,7 +370,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
           <div className="outgoing-recipient">
             <div className="outgoing-qr">
               <QRCodeSVG
-                value={buildZcashUri(pendingInvite.recipient, pendingInvite.memoText)}
+                value={buildZcashUri(pendingInvite.recipient, pendingInvite.memoBytes)}
                 size={140}
                 bgColor="#ffffff"
                 fgColor="#000000"
@@ -396,14 +391,18 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
               </div>
               <div className="outgoing-field">
                 <span className="step-label">encrypted invite</span>
-                <button onClick={() => copyToClipboard(pendingInvite.memoText)} className="btn-copy-memo">
-                  copy memo to paste in wallet
+                <button onClick={() => {
+                  let b = ''
+                  for (let i = 0; i < pendingInvite.memoBytes.length; i++) b += String.fromCharCode(pendingInvite.memoBytes[i])
+                  copyToClipboard(btoa(b).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''))
+                }} className="btn-copy-memo">
+                  copy invite data
                 </button>
               </div>
             </div>
           </div>
           <p className="outgoing-hint">
-            send this shielded transaction from your wallet. only the invited address can decrypt it.
+            scan this qr with your zcash wallet to send the invite. shielded only.
           </p>
         </div>
       )}
@@ -478,7 +477,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
             <div className="send-zec-qr">
               <div className="outgoing-qr" style={{ margin: '0 auto' }}>
                 <QRCodeSVG
-                  value={buildZcashUri(zecRecipient, '', zecAmount)}
+                  value={buildZcashUri(zecRecipient, undefined, zecAmount)}
                   size={180}
                   bgColor="#ffffff"
                   fgColor="#000000"
@@ -498,7 +497,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
                   <code className="outgoing-amount">{zecAmount} ZEC</code>
                 </div>
                 <button
-                  onClick={() => copyToClipboard(buildZcashUri(zecRecipient, '', zecAmount))}
+                  onClick={() => copyToClipboard(buildZcashUri(zecRecipient, undefined, zecAmount))}
                   className="btn-copy-memo"
                 >
                   copy payment uri

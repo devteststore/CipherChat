@@ -21,23 +21,28 @@ export function JoinRoom({ myAddress, onJoined, onBack }: Props) {
     try {
       const raw = memoInput.trim()
 
-      let blob = raw
-      const separatorIdx = raw.indexOf('---')
-      if (separatorIdx !== -1) {
-        blob = raw.slice(separatorIdx + 3).trim()
+      if (!raw) {
+        setError('no encrypted data found. paste the full memo from your wallet.')
+        setJoining(false)
+        return
       }
 
-      blob = blob.replace(/[^0-9a-fA-F]/g, '')
-
-      if (!blob) {
-        setError('no encrypted data found. paste the full memo from your wallet.')
+      let data: Uint8Array
+      try {
+        const b64 = raw.replace(/[^A-Za-z0-9\-_+/=]/g, '').replace(/-/g, '+').replace(/_/g, '/')
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4)
+        const binary = atob(padded)
+        data = new Uint8Array(binary.length)
+        for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i)
+      } catch {
+        setError('invalid invite data. paste the memo exactly as shown in your wallet.')
         setJoining(false)
         return
       }
 
       let invite
       try {
-        invite = await decryptInviteBlob(blob, myAddress)
+        invite = await decryptInviteBlob(data, myAddress)
       } catch {
         setError('this invite is not for your wallet. only the authorized address can decrypt it.')
         setJoining(false)

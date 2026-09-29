@@ -12,7 +12,6 @@ export interface InvitePayload {
   roomName: string
   roomCode: string
   roomSecret: string
-  invitedBy: string
 }
 
 const ROOM_INFO = new TextEncoder().encode('zechat-room')
@@ -94,30 +93,30 @@ export function generateRoomId(): string {
 // Key = HKDF(SHA256(recipientAddress + randomSalt), salt, info)
 // The random salt is prepended to the ciphertext so the recipient can decrypt.
 // Without knowing the recipient's address, the blob is unreadable.
-export async function encryptInviteBlob(invite: InvitePayload, recipientAddress: string): Promise<string> {
-  const inviteSalt = crypto.getRandomValues(new Uint8Array(64))
+export async function encryptInviteBlob(invite: InvitePayload, recipientAddress: string): Promise<Uint8Array> {
+  const inviteSalt = crypto.getRandomValues(new Uint8Array(32))
   const seed = new TextEncoder().encode(recipientAddress)
   const combined = new Uint8Array(seed.length + inviteSalt.length)
   combined.set(seed, 0)
   combined.set(inviteSalt, seed.length)
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', combined))
   const key = await hkdfDeriveKey(hash, inviteSalt, INVITE_INFO)
-  const plaintext = new TextEncoder().encode(JSON.stringify(invite))
+  const compact = JSON.stringify({ i: invite.roomId, n: invite.roomName, c: invite.roomCode, s: invite.roomSecret })
+  const plaintext = new TextEncoder().encode(compact)
   const encrypted = await aesEncrypt(plaintext, key)
   secureWipe(combined)
   secureWipe(hash)
   secureWipe(plaintext)
-  const blob = new Uint8Array(64 + encrypted.length)
+  const blob = new Uint8Array(32 + encrypted.length)
   blob.set(inviteSalt, 0)
-  blob.set(encrypted, 64)
+  blob.set(encrypted, 32)
   secureWipe(inviteSalt)
-  return uint8ToHex(blob)
+  return blob
 }
 
-export async function decryptInviteBlob(blob: string, myAddress: string): Promise<InvitePayload> {
-  const data = hexToUint8(blob)
-  const inviteSalt = data.slice(0, 64)
-  const encrypted = data.slice(64)
+export async function decryptInviteBlob(data: Uint8Array, myAddress: string): Promise<InvitePayload> {
+  const inviteSalt = data.slice(0, 32)
+  const encrypted = data.slice(32)
   const seed = new TextEncoder().encode(myAddress)
   const combined = new Uint8Array(seed.length + inviteSalt.length)
   combined.set(seed, 0)
@@ -125,12 +124,11 @@ export async function decryptInviteBlob(blob: string, myAddress: string): Promis
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-512', combined))
   const key = await hkdfDeriveKey(hash, inviteSalt, INVITE_INFO)
   const plaintext = await aesDecrypt(encrypted, key)
-  const result = JSON.parse(new TextDecoder().decode(plaintext))
+  const compact = JSON.parse(new TextDecoder().decode(plaintext))
   secureWipe(combined)
   secureWipe(hash)
   secureWipe(plaintext)
-  secureWipe(data)
-  return result
+  return { roomId: compact.i, roomName: compact.n, roomCode: compact.c, roomSecret: compact.s }
 }
 
 // --- Chat encryption with one-way key ratchet ---
