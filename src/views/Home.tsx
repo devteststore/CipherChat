@@ -29,7 +29,7 @@ export function Home({ onStartChat, onJoinChat }: Props) {
     async function runChecks() {
       const results: { label: string; ok: boolean }[] = []
 
-      const hasCrypto = !!(globalThis.crypto?.subtle?.encrypt && globalThis.crypto?.subtle?.deriveKey && globalThis.crypto?.getRandomValues)
+      const hasCrypto = typeof globalThis.crypto?.subtle?.encrypt === 'function' && typeof globalThis.crypto?.subtle?.deriveKey === 'function' && typeof globalThis.crypto?.getRandomValues === 'function'
       results.push({ label: 'webcrypto engine', ok: hasCrypto })
 
       let aesOk = false
