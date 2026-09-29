@@ -48,7 +48,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
 
   const [pendingInvite, setPendingInvite] = useState<{
     recipient: string
-    memoBytes: Uint8Array
+    memoText: string
   } | null>(null)
 
   // Send ZEC flow
@@ -151,14 +151,23 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
     }
   }, [input, memoKey, myIndex, myAddress, channelHash])
 
-  function buildZcashUri(address: string, memo?: Uint8Array, amount?: string): string {
+  function bytesToBase64(bytes: Uint8Array): string {
+    let binary = ''
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  }
+
+  function toBase64Url(str: string): string {
+    const bytes = new TextEncoder().encode(str)
+    let binary = ''
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  }
+
+  function buildZcashUri(address: string, memo?: string, amount?: string): string {
     const amt = amount || '0.00001'
     if (!memo) return `zcash:${address}?amount=${amt}`
-    let binary = ''
-    for (let i = 0; i < memo.length; i++) binary += String.fromCharCode(memo[i])
-    const memoB64url = btoa(binary)
-      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-    return `zcash:${address}?amount=${amt}&memo=${memoB64url}`
+    return `zcash:${address}?amount=${amt}&memo=${toBase64Url(memo)}`
   }
 
   function startSendZec() {
@@ -244,10 +253,11 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
         roomSecret: room.roomSecret,
       }
       const memoBytes = await encryptInviteBlob(invite, addr)
+      const memoText = bytesToBase64(memoBytes)
 
       setPendingInvite({
         recipient: addr,
-        memoBytes,
+        memoText,
       })
 
       const updated: RoomData = {
@@ -370,7 +380,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
           <div className="outgoing-recipient">
             <div className="outgoing-qr">
               <QRCodeSVG
-                value={buildZcashUri(pendingInvite.recipient, pendingInvite.memoBytes)}
+                value={buildZcashUri(pendingInvite.recipient, pendingInvite.memoText)}
                 size={140}
                 bgColor="#ffffff"
                 fgColor="#000000"
@@ -391,11 +401,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
               </div>
               <div className="outgoing-field">
                 <span className="step-label">encrypted invite</span>
-                <button onClick={() => {
-                  let b = ''
-                  for (let i = 0; i < pendingInvite.memoBytes.length; i++) b += String.fromCharCode(pendingInvite.memoBytes[i])
-                  copyToClipboard(btoa(b).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''))
-                }} className="btn-copy-memo">
+                <button onClick={() => copyToClipboard(pendingInvite.memoText)} className="btn-copy-memo">
                   copy invite data
                 </button>
               </div>
