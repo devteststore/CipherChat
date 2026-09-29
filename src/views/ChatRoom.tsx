@@ -157,10 +157,17 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   }
 
+  function toBase64Url(str: string): string {
+    const bytes = new TextEncoder().encode(str)
+    let binary = ''
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  }
+
   function buildZcashUri(address: string, memo?: string, amount?: string): string {
     const amt = amount || '0.00001'
     if (!memo) return `zcash:${address}?amount=${amt}`
-    return `zcash:${address}?amount=${amt}&memo=${memo}`
+    return `zcash:${address}?amount=${amt}&memo=${toBase64Url(memo)}`
   }
 
   function startSendZec() {
