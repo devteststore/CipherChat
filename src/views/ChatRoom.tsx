@@ -4,7 +4,7 @@ import type { RoomData } from '../lib/crypto'
 import {
   deriveMemoKey, encryptMessage, decryptMessage,
   uint8ToBase64, base64ToUint8,
-  encryptInviteBlob, getEpoch,
+  encryptInviteBlob, getEpoch, isValidZcashAddress,
 } from '../lib/crypto'
 import { send as transportSend, subscribe as transportSubscribe, hashChannel } from '../lib/transport'
 import type { TransportEnvelope, ChatPayload } from '../lib/transport'
@@ -167,7 +167,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
   function buildZcashUri(address: string, memo?: string, amount?: string): string {
     const amt = amount || '0.00001'
     if (!memo) return `zcash:${address}?amount=${amt}`
-    return `zcash:${address}?amount=${amt}&memo=${toBase64Url(memo)}`
+    return `zcash:${address}?amount=${amt}&memo=${memo}`
   }
 
   function startSendZec() {
@@ -241,6 +241,7 @@ export function ChatRoom({ room, roomCode, myAddress, onLeave, onRoomUpdated }: 
   async function handleInvite() {
     if (!addingMember.trim()) return
     const addr = addingMember.trim()
+    if (!isValidZcashAddress(addr)) return
     if (room.participants.includes(addr)) return
 
     setInviteSending(true)
