@@ -54,15 +54,25 @@ export function secureWipe(arr: Uint8Array) {
   arr.fill(0)
 }
 
-// Tor Project's own onion service (from torproject.org's Onion-Location header).
-// Only a browser routed through Tor can load it; other browsers refuse .onion outright.
-const TOR_ONION = '2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion'
-const TOR_PROBE_ORIGINS = [`https://${TOR_ONION}`]
-const TOR_PROBE_PATH = '/static/images/tor-logo@2x.png'
+// Onion services verified (over Tor) to serve https with a valid certificate and an image.
+// Only a browser routed through Tor can reach any of them; one success is enough.
+const TOR_PROBES = [
+  'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/favicon.ico',
+  'https://protonmailrmez3lotccipshtkleegetolb73fuirgj7r4o4vfu7ozyd.onion/favicon.ico',
+  'https://www.bbcnewsd73hkzno2ini43t4gblxvycyac5aw4gnv7t2rccijh7745uqd.onion/favicon.ico',
+]
+const TOR_PROBE_ORIGINS = TOR_PROBES.map(u => new URL(u).origin)
 
-export async function detectTor(timeoutMs = 30000): Promise<boolean> {
-  const results = await Promise.all(TOR_PROBE_ORIGINS.map(o => probeImage(o + TOR_PROBE_PATH, timeoutMs)))
-  return results.some(Boolean)
+export function detectTor(timeoutMs = 45000): Promise<boolean> {
+  return new Promise(resolve => {
+    let pending = TOR_PROBES.length
+    for (const url of TOR_PROBES) {
+      probeImage(url, timeoutMs).then(ok => {
+        if (ok) resolve(true)
+        else if (--pending === 0) resolve(false)
+      })
+    }
+  })
 }
 
 function probeImage(url: string, timeoutMs: number): Promise<boolean> {
